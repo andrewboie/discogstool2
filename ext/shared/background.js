@@ -1,5 +1,16 @@
 /**
- * background.js — Extension background page for the Discogs Label Printer.
+ * background.js — Background script for the Discogs Label Printer.
+ *
+ * Shared verbatim by the Firefox (MV2 background page) and Chrome (MV3 service
+ * worker) builds; only manifest.json differs between them. The two runtimes
+ * are reconciled at the top of this file:
+ *
+ *   - namespace: Firefox exposes `browser`, Chrome exposes `chrome`
+ *   - toolbar:   MV2 `browserAction` vs MV3 `action`
+ *   - menus:     Firefox `menus` vs Chrome `contextMenus`
+ *   - lifetime:  an MV2 background page persists, so setInterval survives; an
+ *                MV3 service worker is torn down after ~30s idle, so a long
+ *                poll cannot. See pollUntilIdle() for how each is handled.
  *
  * Responsibilities:
  *  1. Enable/disable the browser action (toolbar button) based on whether the
@@ -10,13 +21,25 @@
  *
  * Communication with dt_server:
  *  - All requests go to http://localhost:{port}/ where port defaults to 5679
- *    and is persisted in browser.storage.local under the key "port".
+ *    and is persisted in storage.local under the key "port".
  *  - The context menu handler reads the stored profile/split/preview settings
  *    and sends the same JSON body as the popup's print button.
  */
 
 // Show/enable the browser action only on Discogs release pages.
 // URL pattern: discogs.com/release/DIGITS or discogs.com/*/release/DIGITS
+
+// ── Cross-browser API shim ────────────────────────────────────────────────────
+
+const api    = globalThis.browser ?? globalThis.chrome;
+const action = api.action ?? api.browserAction;   // MV3 ?? MV2
+const menus  = api.menus  ?? api.contextMenus;    // Firefox ?? Chrome
+
+// An MV3 service worker has no window and is terminated when idle; an MV2
+// background page lives as long as the browser does.
+const IS_SERVICE_WORKER =
+  typeof ServiceWorkerGlobalScope !== "undefined" &&
+  globalThis instanceof ServiceWorkerGlobalScope;
 
 const RELEASE_URL = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DISCOGS_URL  = /discogs\.com/;
@@ -25,25 +48,25 @@ const STORAGE_KEYS = ["port", "profile", "split", "hide_bpm", "preview"];
 
 function updateAction(tabId, url) {
   if (url && DISCOGS_URL.test(url)) {
-    browser.browserAction.enable(tabId);
+    action.enable(tabId);
   } else {
-    browser.browserAction.disable(tabId);
+    action.disable(tabId);
   }
 }
 
-browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url !== undefined) {
     updateAction(tabId, changeInfo.url);
   }
 });
 
-browser.tabs.onActivated.addListener(async ({ tabId }) => {
-  const tab = await browser.tabs.get(tabId);
+api.tabs.onActivated.addListener(async ({ tabId }) => {
+  const tab = await api.tabs.get(tabId);
   updateAction(tabId, tab.url);
 });
 
 // Disable on all tabs at startup; they'll re-enable via onActivated.
-browser.tabs.query({}).then(tabs => {
+api.tabs.query({}).then(tabs => {
   for (const tab of tabs) {
     updateAction(tab.id, tab.url);
   }
@@ -51,7 +74,7 @@ browser.tabs.query({}).then(tabs => {
 
 // ── Context menu: right-click a Discogs release link to print ─────────────────
 
-browser.menus.create({
+menus.create({
   id: "print-label",
   title: "Print Label",
   contexts: ["link"],
@@ -61,14 +84,14 @@ browser.menus.create({
   ],
 });
 
-browser.menus.onClicked.addListener(async (info) => {
+menus.onClicked.addListener(async (info) => {
   if (info.menuItemId !== "print-label") return;
 
   const m = RELEASE_URL.exec(info.linkUrl);
   if (!m) return;
   const releaseId = m[1];
 
-  const stored  = await browser.storage.local.get(STORAGE_KEYS);
+  const stored  = await api.storage.local.get(STORAGE_KEYS);
   const port    = stored.port    || DEFAULT_PORT;
   const profile = stored.profile || "dk1247";
   const split   = stored.split   || false;
@@ -96,7 +119,7 @@ browser.menus.onClicked.addListener(async (info) => {
     }
     if (preview && data.preview_urls?.length) {
       for (const url of data.preview_urls) {
-        browser.tabs.create({ url: `http://localhost:${port}${url}` });
+        api.tabs.create({ url: `http://localhost:${port}${url}` });
       }
     } else if (!preview) {
       // Don't claim it printed — it's only queued at this point. The badge
@@ -115,7 +138,7 @@ browser.menus.onClicked.addListener(async (info) => {
 });
 
 function notify(title, message, isError = false) {
-  browser.notifications.create({
+  api.notifications.create({
     type:    "basic",
     iconUrl: isError ? "icons/icon-48.png" : "icons/icon-48.png",
     title,
@@ -132,7 +155,7 @@ let badgeTimer = null;
 let lastFailures = 0;
 
 async function refreshBadge() {
-  const stored = await browser.storage.local.get(["port"]);
+  const stored = await api.storage.local.get(["port"]);
   const port   = stored.port || DEFAULT_PORT;
 
   let data;
@@ -171,29 +194,59 @@ async function refreshBadge() {
 }
 
 function setBadge(text, colour) {
-  browser.browserAction.setBadgeText({ text });
+  action.setBadgeText({ text });
   if (text) {
-    browser.browserAction.setBadgeBackgroundColor({ color: colour });
+    action.setBadgeBackgroundColor({ color: colour });
   }
 }
 
+// Keeping the badge current means polling, and the two runtimes allow very
+// different things here.
+//
+// MV2 background page: persists, so a 1s setInterval simply works.
+//
+// MV3 service worker: torn down after ~30s idle, taking any interval with it.
+// chrome.alarms survives teardown but its floor is 60s — far too coarse for a
+// queue that drains in seconds. So the badge is refreshed at the moments that
+// actually matter (a job is queued, the popup opens, the worker wakes) with a
+// 1-minute alarm as a backstop. Between those it can lag; the popup polls
+// properly at 500ms whenever it is open, which is when anyone is watching.
+
+const BADGE_ALARM = "dt-badge-poll";
+
 function pollUntilIdle() {
-  if (badgeTimer !== null) return;     // already polling
   refreshBadge();
-  badgeTimer = setInterval(refreshBadge, BADGE_POLL_MS);
+
+  if (IS_SERVICE_WORKER) {
+    // periodInMinutes below 1 is silently clamped by Chrome.
+    api.alarms?.create(BADGE_ALARM, { periodInMinutes: 1 });
+    return;
+  }
+  if (badgeTimer === null) {
+    badgeTimer = setInterval(refreshBadge, BADGE_POLL_MS);
+  }
 }
 
 function stopPolling() {
+  if (IS_SERVICE_WORKER) {
+    api.alarms?.clear(BADGE_ALARM);
+    return;
+  }
   if (badgeTimer !== null) {
     clearInterval(badgeTimer);
     badgeTimer = null;
   }
 }
 
+api.alarms?.onAlarm.addListener((alarm) => {
+  if (alarm.name === BADGE_ALARM) refreshBadge();
+});
+
 // The popup posts its own print requests, so listen for those too and start
 // the badge poll on its behalf.
-browser.runtime.onMessage.addListener((msg) => {
-  if (msg?.type === "job-queued") pollUntilIdle();
+api.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === "job-queued")   pollUntilIdle();
+  if (msg?.type === "popup-opened") refreshBadge();
 });
 
 // Pick up anything already running when the browser starts.

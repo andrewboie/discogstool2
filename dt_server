@@ -152,12 +152,23 @@ def start_worker():
                      name="print-worker").start()
 
 
-# ── CORS (allow requests from any moz-extension:// origin) ───────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Only browser-extension origins are echoed back.  The server binds to
+# localhost, but any page the user visits could otherwise POST to it, so the
+# allowlist stays narrow: no wildcard, no http(s) origins.
+
+_EXTENSION_ORIGINS = ("moz-extension://", "chrome-extension://")
+
+
+def _is_extension_origin(origin):
+    """True for a Firefox or Chrome extension origin."""
+    return any(origin.startswith(scheme) for scheme in _EXTENSION_ORIGINS)
+
 
 @app.after_request
 def add_cors(response):
     origin = request.headers.get("Origin", "")
-    if origin.startswith("moz-extension://"):
+    if _is_extension_origin(origin):
         response.headers["Access-Control-Allow-Origin"]  = origin
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"

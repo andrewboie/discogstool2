@@ -10,7 +10,7 @@ A Python toolkit for digitising vinyl records and managing a Discogs collection.
 
 1. Record vinyl sides in Reaper, exporting WAV files with region markers at track boundaries
 2. Run `dt_process` to split by region, fetch metadata from Discogs, EBU-R128 normalise, convert to AIFF/ALAC, embed cover art and tags
-3. Optionally run `dt_label` (or trigger it via the Firefox extension + `dt_server`) to print a Brother thermal sleeve label
+3. Optionally run `dt_label` (or trigger it via the browser extension + `dt_server`) to print a Brother thermal sleeve label
 4. Use `dt_collection` to compare local files against a Discogs collection export and update stale metadata
 5. Use `dt_find` to identify an unknown record via voice/text description through an LLM + Discogs search agent loop
 
@@ -19,7 +19,7 @@ A Python toolkit for digitising vinyl records and managing a Discogs collection.
 ## Repository Layout
 
 ```
-dt_server          Flask HTTP bridge (localhost:5679) for Firefox extension
+dt_server          Flask HTTP bridge (localhost:5679) for the browser extensions
 dt_process         Audio processing pipeline (split → normalise → convert → tag)
 dt_label           Label renderer + printer
 dt_find            LLM-driven record identification (voice or typed)
@@ -32,10 +32,13 @@ libtags.py            Audio tag I/O (Mutagen — ID3, MP4, FLAC)
 wavfile.py            WAV reader with region/loop support (Reaper smpl chunk)
 util.py               Shared helpers (paths, file discovery, collection CSV)
 
-firefox-ext/          WebExtension (popup.html/js, background.js, manifest.json)
+ext/shared/           WebExtension sources shared by both browsers
+ext/firefox/          Firefox manifest.json (MV2)
+ext/chrome/           Chrome manifest.json (MV3)
+build_ext.sh          Assembles firefox-ext/ and chrome-ext/ (both gitignored)
 tests/                pytest suite (one file per module)
 install_server.sh     macOS launchd plist installer for dt_server
-sign_extension.sh     AMO signing for Firefox extension
+sign_extension.sh     AMO signing for the Firefox build
 requirements.txt      Python dependencies
 ```
 
@@ -45,7 +48,13 @@ All entry-point scripts have no `.py` extension. Tests load them via `importlib.
 
 ## Architecture
 
-### dt_server ↔ Firefox extension
+### dt_server ↔ browser extension
+
+The extension ships for Firefox and Chrome from one set of sources. Everything except `manifest.json` is shared: `background.js` reconciles the two runtimes itself (`browser` vs `chrome`, `browserAction` vs `action`, `menus` vs `contextMenus`). Run `./build_ext.sh` to assemble `firefox-ext/` and `chrome-ext/`; both are generated and gitignored, so **edit `ext/`, never the build output**. `sign_extension.sh` builds before signing.
+
+Chrome requires MV3, which makes the background script a service worker that Chrome terminates after ~30 s idle — so the 1 s `setInterval` badge poll cannot survive there, and `chrome.alarms` has a 60 s floor. The badge is therefore refreshed at the moments that matter (job queued, popup opened, worker woken) with a 1-minute alarm as a backstop; the popup polls at 500 ms whenever it is open, which is when anyone is actually watching. Firefox keeps the 1 s interval, since an MV2 background page persists.
+
+CORS on dt_server echoes back only `moz-extension://` and `chrome-extension://` origins — never a wildcard, and never an `http(s)` origin, since the server binds to localhost where any visited page could otherwise reach it.
 
 The extension popup calls `http://localhost:5679/status` (health) and `POST /print` (release_id, profile, preview, split, discs). The server delegates to `dt_label` as a subprocess, serves preview PNGs from a temp dir, and reports Discogs/Beatport/Anthropic/LLM credential status in the `/status` response. The popup footer displays four connection dots: Discogs, Beatport, Anthropic (used by the Beatport matcher), and Finder (the dt_find LLM backend, labelled "Claude" or "Local LLM" depending on the configured backend).
 
@@ -57,7 +66,7 @@ Because printing is async, errors no longer ride back on the `/print` response �
 
 **The popup's status line is derived from `/progress`, never captured from the `POST /print` response.** Writing it at POST time produced a line frozen on "Queued." while the label was already printing. `describeJob()` in popup.js is the single place that decides the text; `holdStatus` is the only override, reserved for terminal messages (preview opened, request failed) that must outlive job state. A finished job clears from the panel after `RECENT_GRACE_S`, so reopening the popup later doesn't look like work is still in flight.
 
-`tests/js/popup_harness.js` stubs `document`/`browser`, evaluates the real popup.js, and asserts the status text across job states; `tests/test_popup_js.py` runs it under pytest (skipped without node).
+`tests/js/popup_harness.js` stubs `document` plus the extension API, evaluates the real popup.js, and asserts the status text across job states. `tests/test_extensions.py` runs it under **both** the `browser` and `chrome` namespaces, and also pins manifest consistency (versions in step, MV2 vs MV3 keys, no host permissions beyond localhost).
 
 `GET /progress` returns the running job, queued jobs, `depth`, and `failures`. `POST /jobs/clear` drops finished/failed history. The popup polls `/progress` every 500 ms while open; `background.js` polls once per second only while work is outstanding, driving the toolbar badge (queue depth in orange, failure count in red).
 
@@ -211,11 +220,20 @@ python3 dt_server --port 5680
 launchctl kickstart -k gui/$(id -u)/com.discogstool.server  # restart
 ```
 
-### Firefox extension
-- Dev: `about:debugging` → Load Temporary Add-on → `firefox-ext/manifest.json`
-- Prod: `./sign_extension.sh` (requires npm + AMO API credentials in `~/.discogstool/amo_auth`)
+### Browser extensions
 
-**Important**: The `version` field in `firefox-ext/manifest.json` **must be incremented** whenever any extension file is changed (`popup.html`, `popup.js`, `background.js`, `manifest.json` itself, etc.). AMO rejects re-signing with an already-used version number, so `sign_extension.sh` will fail with an error if you forget to bump it.
+```bash
+./build_ext.sh              # both
+./build_ext.sh chrome       # one
+```
+
+- Firefox dev: `about:debugging` → Load Temporary Add-on → `firefox-ext/manifest.json`
+- Firefox prod: `./sign_extension.sh` (builds first; needs npm + AMO credentials in `~/.discogstool/amo_auth`)
+- Chrome: `chrome://extensions` → Developer mode → Load unpacked → `chrome-ext/`
+
+Chrome is installed unpacked rather than via the Web Store, so there is no signing step and no version gate — but Chrome shows a developer-mode notice, and the extension ID changes if the directory moves.
+
+**Important**: The `version` field in `ext/firefox/manifest.json` (and `ext/chrome/manifest.json`, which a test asserts stays in step) **must be incremented** whenever any extension file is changed (anything under `ext/`). AMO rejects re-signing with an already-used version number, so `sign_extension.sh` will fail with an error if you forget to bump it.
 
 ### dt_find LLM backend
 

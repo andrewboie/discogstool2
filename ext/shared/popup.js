@@ -1,3 +1,7 @@
+// Firefox exposes `browser`, Chrome exposes `chrome`; both support promises
+// for the APIs used here (Chrome does so from MV3 onwards).
+const api = globalThis.browser ?? globalThis.chrome;
+
 const RELEASE_RE = /discogs\.com\/(?:[^/]+\/)?release\/(\d+)/;
 const DEFAULT_PORT = 5679;
 const STORAGE_KEYS = ["port", "profile", "split", "hide_bpm", "preview"];
@@ -17,7 +21,7 @@ const portEl       = document.getElementById("port");
 let releaseId = null;
 
 // ── Restore saved settings ────────────────────────────────────────────────────
-browser.storage.local.get(STORAGE_KEYS).then(saved => {
+api.storage.local.get(STORAGE_KEYS).then(saved => {
   if (saved.port)     portEl.value       = saved.port;
   if (saved.profile)  profileEl.value    = saved.profile;
   if (saved.split)    splitEl.checked    = saved.split;
@@ -29,25 +33,25 @@ browser.storage.local.get(STORAGE_KEYS).then(saved => {
 
 // Persist settings on change
 portEl.addEventListener("change", () => {
-  browser.storage.local.set({ port: portEl.value });
+  api.storage.local.set({ port: portEl.value });
 });
 profileEl.addEventListener("change", () => {
-  browser.storage.local.set({ profile: profileEl.value });
+  api.storage.local.set({ profile: profileEl.value });
 });
 splitEl.addEventListener("change", () => {
-  browser.storage.local.set({ split: splitEl.checked });
+  api.storage.local.set({ split: splitEl.checked });
   discsRowEl.classList.toggle("hidden", !splitEl.checked);
   if (!splitEl.checked) discsEl.value = "";
 });
 hideBpmEl.addEventListener("change", () => {
-  browser.storage.local.set({ hide_bpm: hideBpmEl.checked });
+  api.storage.local.set({ hide_bpm: hideBpmEl.checked });
 });
 previewEl.addEventListener("change", () => {
-  browser.storage.local.set({ preview: previewEl.checked });
+  api.storage.local.set({ preview: previewEl.checked });
 });
 
 // ── Detect release ID from active tab ─────────────────────────────────────────
-browser.tabs.query({ active: true, currentWindow: true }).then(tabs => {
+api.tabs.query({ active: true, currentWindow: true }).then(tabs => {
   const url = tabs[0]?.url ?? "";
   const m = RELEASE_RE.exec(url);
   if (m) {
@@ -95,7 +99,7 @@ printBtn.addEventListener("click", async () => {
 
     if (preview && data.preview_urls?.length) {
       for (const url of data.preview_urls) {
-        await browser.tabs.create({ url: `http://localhost:${port}${url}` });
+        await api.tabs.create({ url: `http://localhost:${port}${url}` });
       }
       const count = data.preview_urls.length;
       setStatus(`${count} preview${count > 1 ? "s" : ""} opened in new tab${count > 1 ? "s" : ""}.`, "ok");
@@ -105,7 +109,7 @@ printBtn.addEventListener("click", async () => {
       // its state changes within milliseconds, so anything written now goes
       // stale immediately — that is how the line ended up reading "Queued."
       // while the label was already printing. pollProgress() owns this line.
-      browser.runtime.sendMessage({ type: "job-queued" }).catch(() => {});
+      api.runtime.sendMessage({ type: "job-queued" }).catch(() => {});
       pollProgress();      // paint real state at once rather than waiting a tick
     }
   } catch (err) {
@@ -256,6 +260,7 @@ async function pollProgress() {
   }
 }
 
+api.runtime.sendMessage({ type: "popup-opened" }).catch(() => {});
 pollProgress();
 setInterval(pollProgress, POLL_MS);
 

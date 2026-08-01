@@ -1,5 +1,5 @@
 const fs = require('fs'), vm = require('vm'), path = require('path');
-const POPUP = path.join(__dirname, '..', '..', 'firefox-ext', 'popup.js');
+const POPUP = path.join(__dirname, '..', '..', 'ext', 'shared', 'popup.js');
 
 function mkEl(id) {
   const el = {
@@ -25,18 +25,28 @@ const document = {
   getElementById: id => els[id] ||= mkEl(id),
   querySelectorAll: sel => sel === '#stages li' ? stageLis : [],
 };
-const browser = {
-  storage: { local: { get: () => Promise.resolve({}), set() {} } },
-  tabs: { query: () => Promise.resolve([{ url: 'https://discogs.com/release/123' }]), create: () => Promise.resolve() },
-  runtime: { sendMessage: () => Promise.resolve() },
-};
+
+function makeExtApi() {
+  return {
+    storage: { local: { get: () => Promise.resolve({}), set() {} } },
+    tabs: { query: () => Promise.resolve([{ url: 'https://discogs.com/release/123' }]), create: () => Promise.resolve() },
+    runtime: { sendMessage: () => Promise.resolve() },
+  };
+}
+
+// popup.js resolves `globalThis.browser ?? globalThis.chrome`. Run the whole
+// suite under each namespace so the Chrome build is covered too, not just
+// assumed to work.
+const NAMESPACE = process.env.EXT_NAMESPACE || 'browser';
+
 const ctx = {
-  document, browser, console,
+  document, console,
   fetch: () => Promise.reject(new Error('no net')),
   setInterval: () => 0, setTimeout: () => 0, clearTimeout() {},
   AbortController: class { constructor(){ this.signal = null; } },
   AbortSignal: { timeout: () => null },
 };
+ctx[NAMESPACE] = makeExtApi();
 ctx.globalThis = ctx;
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(POPUP, 'utf8'), ctx);
@@ -50,8 +60,8 @@ function expect(label, payload, wantText, wantCls, wantHidden) {
   const got = [status.textContent, status.className, progress._classes.has('hidden')];
   const want = [wantText, wantCls, wantHidden];
   const ok = JSON.stringify(got) === JSON.stringify(want);
-  if (!ok) { failures++; console.log(`FAIL ${label}\n  want ${JSON.stringify(want)}\n  got  ${JSON.stringify(got)}`); }
-  else console.log(`ok   ${label}`);
+  if (!ok) { failures++; console.log(`FAIL [${NAMESPACE}] ${label}\n  want ${JSON.stringify(want)}\n  got  ${JSON.stringify(got)}`); }
+  else console.log(`ok   [${NAMESPACE}] ${label}`);
 }
 
 const now = Date.now()/1000;

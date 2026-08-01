@@ -57,6 +57,12 @@ if [[ -z "${AMO_API_KEY:-}" || -z "${AMO_API_SECRET:-}" ]]; then
     save_creds
 fi
 
+# ── Build ─────────────────────────────────────────────────────────────────────
+# firefox-ext/ is generated from ext/shared + ext/firefox, so build it first —
+# otherwise a change made in ext/ would be silently left out of the signed xpi.
+
+"${SCRIPT_DIR}/build_ext.sh" firefox
+
 # ── Sign ──────────────────────────────────────────────────────────────────────
 
 echo "Signing firefox-ext/ as unlisted extension..."

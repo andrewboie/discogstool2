@@ -399,3 +399,47 @@ class TestProgressEndpoint:
 
     def test_progress_options_preflight(self, client):
         assert client.options("/progress").status_code == 204
+
+
+# ─── CORS origin allowlist ────────────────────────────────────────────────────
+
+class TestCorsOrigins:
+    """Only browser-extension origins may talk to the server.
+
+    dt_server binds to localhost, but any web page the user has open could
+    otherwise POST to it, so the allowlist must not widen to http(s) origins.
+    """
+
+    def test_firefox_origin_allowed(self, client):
+        r = client.get("/status", headers={"Origin": "moz-extension://abc123"})
+        assert r.headers.get("Access-Control-Allow-Origin") == "moz-extension://abc123"
+
+    def test_chrome_origin_allowed(self, client):
+        r = client.get("/status", headers={"Origin": "chrome-extension://def456"})
+        assert r.headers.get("Access-Control-Allow-Origin") == "chrome-extension://def456"
+
+    def test_origin_is_echoed_not_wildcarded(self, client):
+        r = client.get("/status", headers={"Origin": "chrome-extension://xyz"})
+        assert r.headers.get("Access-Control-Allow-Origin") != "*"
+
+    @pytest.mark.parametrize("origin", [
+        "https://www.discogs.com",
+        "http://localhost:8080",
+        "http://evil.example.com",
+        "file://",
+        "",
+    ])
+    def test_non_extension_origins_rejected(self, client, origin):
+        r = client.get("/status", headers={"Origin": origin})
+        assert "Access-Control-Allow-Origin" not in r.headers
+
+    def test_lookalike_origin_rejected(self):
+        """Substring tricks must not pass the prefix check."""
+        assert not dt_server._is_extension_origin("https://moz-extension://x")
+        assert not dt_server._is_extension_origin("https://evil.com/chrome-extension://")
+
+    def test_preflight_carries_cors_headers(self, client):
+        r = client.options("/print", headers={"Origin": "chrome-extension://abc"})
+        assert r.status_code == 204
+        assert r.headers.get("Access-Control-Allow-Origin") == "chrome-extension://abc"
+        assert "POST" in r.headers.get("Access-Control-Allow-Methods", "")
