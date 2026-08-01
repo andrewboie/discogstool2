@@ -60,24 +60,12 @@ RESULTS_PER_SEARCH = 8
 
 
 def load_config() -> dict:
-    path = util.userfile(CONFIG_FILE)
-    config: dict = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    config[k.strip()] = v.strip()
-    return config
+    return util.load_kv_config(util.userfile(CONFIG_FILE))
 
 
 def save_config(config: dict) -> None:
-    path = util.userfile(CONFIG_FILE)
-    with open(path, "w") as f:
-        f.write("# dt_find configuration — auto-updated\n")
-        for k, v in config.items():
-            f.write(f"{k}={v}\n")
+    util.save_kv_config(util.userfile(CONFIG_FILE), config,
+                        header="dt_find configuration — auto-updated")
 
 
 # ── Voice input ────────────────────────────────────────────────────────────────
@@ -355,6 +343,38 @@ def _extract_think(text: str) -> str | None:
 
 # ── Abstract LLM backend ──────────────────────────────────────────────────────
 
+def _dispatch_tool(name: str, args: dict) -> tuple[dict, tuple[int, str] | None]:
+    """Execute one tool call from either backend.
+
+    The two backends speak different wire formats (OpenAI `tool_calls` vs
+    Anthropic `tool_use` blocks), but the decision and side effects for a given
+    tool are identical.  That shared part lives here so it cannot drift.
+
+    Returns (payload, selection):
+      payload   — JSON-serialisable result to hand back to the model
+      selection — (release_id, reasoning) if a release was picked, else None
+    """
+    if name == "select_release":
+        raw = args.get("release_id")
+        try:
+            release_id = int(raw)
+        except (TypeError, ValueError):
+            # A malformed id used to raise and kill the run mid-conversation.
+            # Report it as a tool error so the model can correct itself.
+            return {"error": f"Invalid release_id: {raw!r}"}, None
+        return {"status": "ok"}, (release_id, args.get("reasoning", ""))
+
+    if name == "search_discogs":
+        print(f"  🔍  Searching: {_fmt_search_args(args)}", flush=True)
+        result = _tool_search_discogs(**args)
+        n     = len(result.get("results", []))
+        total = result.get("count", 0)
+        print(f"      → {n} result(s) returned  ({total} total on Discogs)")
+        return result, None
+
+    return {"error": f"Unknown tool: {name}"}, None
+
+
 class LLMBackend(ABC):
     """Abstract base for LLM backends used by dt_find.
 
@@ -483,42 +503,20 @@ class LocalLLMBackend(LLMBackend):
 
             # Execute each tool call
             for tc in msg.tool_calls:
-                name = tc.function.name
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
 
-                if name == "select_release":
-                    release_id = args.get("release_id")
-                    reasoning  = args.get("reasoning", "")
-                    # Acknowledge the tool call so the model can close gracefully
-                    messages.append({
-                        "role":         "tool",
-                        "tool_call_id": tc.id,
-                        "content":      json.dumps({"status": "ok"}),
-                    })
-                    return int(release_id), reasoning
-
-                elif name == "search_discogs":
-                    print(f"  🔍  Searching: {_fmt_search_args(args)}", flush=True)
-                    result = _tool_search_discogs(**args)
-                    n     = len(result.get("results", []))
-                    total = result.get("count", 0)
-                    print(f"      → {n} result(s) returned  ({total} total on Discogs)")
-                    messages.append({
-                        "role":         "tool",
-                        "tool_call_id": tc.id,
-                        "content":      json.dumps(result),
-                    })
-
-                else:
-                    # Unknown tool — return an error so the model can recover
-                    messages.append({
-                        "role":         "tool",
-                        "tool_call_id": tc.id,
-                        "content":      json.dumps({"error": f"Unknown tool: {name}"}),
-                    })
+                payload, selection = _dispatch_tool(tc.function.name, args)
+                # Always acknowledge, so the model can close gracefully.
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      json.dumps(payload),
+                })
+                if selection is not None:
+                    return selection
 
         print("\nReached search limit without a confident match.", file=sys.stderr)
         return None, ""
@@ -547,17 +545,7 @@ class AnthropicBackend(LLMBackend):
 
     def _get_api_key(self) -> str | None:
         """Read API key from beatport_auth.json or ANTHROPIC_API_KEY env var."""
-        try:
-            auth_path = util.userfile("beatport_auth.json")
-            if os.path.exists(auth_path):
-                with open(auth_path) as f:
-                    data = json.load(f)
-                key = data.get("anthropic_api_key")
-                if key:
-                    return key
-        except Exception:
-            pass
-        return os.environ.get("ANTHROPIC_API_KEY")
+        return util.resolve_anthropic_key()
 
     def check_available(self) -> tuple[bool, str]:
         key = self._get_api_key()
@@ -627,38 +615,15 @@ class AnthropicBackend(LLMBackend):
             selected: tuple[int, str] | None = None
 
             for tc in tool_uses:
-                tc_id = tc.get("id", "")
-                name  = tc.get("name", "")
-                inp   = tc.get("input", {})
-
-                if name == "select_release":
-                    release_id = inp.get("release_id")
-                    reasoning  = inp.get("reasoning", "")
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": tc_id,
-                        "content":     json.dumps({"status": "ok"}),
-                    })
-                    selected = (int(release_id), reasoning)
-
-                elif name == "search_discogs":
-                    print(f"  🔍  Searching: {_fmt_search_args(inp)}", flush=True)
-                    result = _tool_search_discogs(**inp)
-                    n     = len(result.get("results", []))
-                    total = result.get("count", 0)
-                    print(f"      → {n} result(s) returned  ({total} total on Discogs)")
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": tc_id,
-                        "content":     json.dumps(result),
-                    })
-
-                else:
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": tc_id,
-                        "content":     json.dumps({"error": f"Unknown tool: {name}"}),
-                    })
+                payload, selection = _dispatch_tool(tc.get("name", ""),
+                                                    tc.get("input", {}))
+                tool_results.append({
+                    "type":        "tool_result",
+                    "tool_use_id": tc.get("id", ""),
+                    "content":     json.dumps(payload),
+                })
+                if selection is not None:
+                    selected = selection
 
             # Tool results must be sent back as a user message
             messages.append({"role": "user", "content": tool_results})

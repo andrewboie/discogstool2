@@ -7,7 +7,7 @@ Covers:
   - flatten_discs: orders disc/side/track tuples
   - parse_release_id: integer and [rXXXXX] format parsing
   - read_id_file: URL mode and plain-ID mode
-  - _continuous_height: height calculation for continuous labels
+  - _layout_height: canvas height measured from a real layout pass
   - _chunk_continuous: greedy packing of tracks onto labels
   - load_config / save_config: key=value dotfile I/O
 """
@@ -42,12 +42,11 @@ group_tracks_by_disc = dt_label.group_tracks_by_disc
 flatten_discs       = dt_label.flatten_discs
 parse_release_id    = dt_label.parse_release_id
 read_id_file        = dt_label.read_id_file
-_continuous_height  = dt_label._continuous_height
+_layout_height      = dt_label._layout_height
 _chunk_continuous   = dt_label._chunk_continuous
 load_config         = dt_label.load_config
 save_config         = dt_label.save_config
 render_label             = dt_label.render_label
-_measure_wrap_extra_px   = dt_label._measure_wrap_extra_px
 LABEL_PROFILES           = dt_label.LABEL_PROFILES
 MAX_LABEL_HEIGHT_PX      = dt_label.MAX_LABEL_HEIGHT_PX
 _QR_SIZE                 = dt_label._QR_SIZE
@@ -333,60 +332,114 @@ class TestConfig:
         assert config["printer"] == "tcp://192.168.1.50:9100"
 
 
-# ─── _continuous_height ───────────────────────────────────────────────────────
+# ─── _layout_height ───────────────────────────────────────────────────────────
 
-def _make_tracks_with_sides(sides_and_counts):
-    """Build a minimal [(side, idx, track)] list for height calculation tests."""
+def _make_tracks_with_sides(sides_and_counts, title="Track Title"):
+    """Build a [(side, idx, track)] list for height tests."""
     result = []
     idx = 0
     for side, count in sides_and_counts:
-        for _ in range(count):
-            result.append((side, idx, MagicMock()))
+        for n in range(count):
+            t = MagicMock()
+            t.__getitem__ = MagicMock(
+                side_effect=lambda k, _p=f"{side}{n+1}": _p if k == "position" else "")
+            t.getArtist.return_value = "Artist"
+            t.getTitle.return_value = title
+            t.getDuration.return_value = None
+            result.append((side, idx, t))
             idx += 1
     return result
 
 
-class TestContinuousHeight:
+def _height_release(title="Release Title"):
+    r = MagicMock()
+    for name, val in [("getId", 1), ("getTitle", title), ("getArtist", "Artist"),
+                      ("getLabel", "Label"), ("getCatno", "CAT1"), ("getYear", "2020"),
+                      ("getLabelYear", "2020"), ("getFormat", '12"'),
+                      ("getCountry", "UK"), ("getGenre", "Electronic"),
+                      ("getStyle", "Techno"), ("getNotes", "")]:
+        getattr(r, name).return_value = val
+    r.isCompilation.return_value = False
+    return r
+
+
+def _h(tracks, profile=None, **kw):
+    return _layout_height(_height_release(), tracks,
+                          profile or LABEL_PROFILES["dk22243"], False, **kw)
+
+
+class TestLayoutHeight:
+    """Height is measured by running the real layout, not predicted.
+
+    Two implementations of the layout drifted apart three separate times and
+    each time the bottom-anchored QR printed over the track listing. There is
+    now one implementation; these tests cover its behaviour.
+    """
+
     PROFILE = LABEL_PROFILES["dk22243"]
 
     def test_returns_positive_int(self):
-        tracks = _make_tracks_with_sides([("A", 4)])
-        h = _continuous_height(tracks, self.PROFILE)
+        h = _h(_make_tracks_with_sides([("A", 4)]))
         assert isinstance(h, int)
         assert h > 0
 
     def test_more_tracks_is_taller(self):
-        h4 = _continuous_height(_make_tracks_with_sides([("A", 4)]), self.PROFILE)
-        h8 = _continuous_height(_make_tracks_with_sides([("A", 8)]), self.PROFILE)
-        assert h8 > h4
+        assert _h(_make_tracks_with_sides([("A", 8)])) > \
+               _h(_make_tracks_with_sides([("A", 4)]))
 
     def test_continuation_shorter_than_normal(self):
         tracks = _make_tracks_with_sides([("A", 4)])
-        h_normal = _continuous_height(tracks, self.PROFILE, continuation=False)
-        h_cont   = _continuous_height(tracks, self.PROFILE, continuation=True)
-        assert h_cont < h_normal
+        assert _h(tracks, continuation=True) < _h(tracks, continuation=False)
 
     def test_disc_info_adds_height(self):
         tracks = _make_tracks_with_sides([("A", 4)])
-        h_no_disc = _continuous_height(tracks, self.PROFILE, disc_info=None)
-        h_disc    = _continuous_height(tracks, self.PROFILE, disc_info=(1, 2))
-        assert h_disc > h_no_disc
+        assert _h(tracks, disc_info=(1, 2)) > _h(tracks, disc_info=None)
 
     def test_side_headers_counted(self):
-        """Two separate sides should be taller than one (extra side header)."""
-        h1 = _continuous_height(_make_tracks_with_sides([("A", 4)]), self.PROFILE)
-        h2 = _continuous_height(_make_tracks_with_sides([("A", 2), ("B", 2)]), self.PROFILE)
-        assert h2 > h1
+        assert _h(_make_tracks_with_sides([("A", 2), ("B", 2)])) > \
+               _h(_make_tracks_with_sides([("A", 4)]))
 
     def test_too_many_tracks_raises(self):
-        """Extremely long tracklist should exceed 12" and raise ValueError."""
-        profile = {
-            "margin_px": 46,
-            "notes_lines": 3,
-        }
-        tracks = _make_tracks_with_sides([("A", 200)])
         with pytest.raises(ValueError, match="12"):
-            _continuous_height(tracks, profile)
+            _h(_make_tracks_with_sides([("A", 200)]))
+
+    def test_wrapping_titles_add_height(self):
+        """A title that wraps must grow the canvas — the r4884361 failure."""
+        short = _make_tracks_with_sides([("A", 3)], title="Short")
+        long_ = _make_tracks_with_sides(
+            [("A", 3)],
+            title="An Extremely Long Reconstruction Title That Certainly Wraps "
+                  "Onto A Second Line No Matter The Font")
+        assert _h(long_) > _h(short)
+
+    def test_height_leaves_exactly_the_qr_block(self):
+        """The canvas must clear the content by the notes gap plus the QR."""
+        tracks = _make_tracks_with_sides([("A", 3)])
+        release = _height_release()
+        h = _layout_height(release, tracks, self.PROFILE, False)
+        bottom = dt_label.render_label(release, tracks, self.PROFILE, False,
+                                       probe=True)
+        assert h == bottom + dt_label._NOTES_GAP + _QR_SIZE + self.PROFILE["margin_px"]
+
+    def test_probe_is_independent_of_canvas_height(self):
+        """Probe output must not depend on the canvas it was measured on.
+
+        This is what makes a 1px scratch canvas valid: content layout never
+        reads H, only the bottom-anchored QR does.
+        """
+        tracks = _make_tracks_with_sides([("A", 5)])
+        release = _height_release()
+        a = dt_label.render_label(release, tracks, self.PROFILE, False, probe=True)
+        b = dt_label.render_label(release, tracks, self.PROFILE, False,
+                                  height_px=3600, probe=True)
+        assert a == b
+
+    def test_probe_draws_nothing_permanent(self):
+        """Probe returns a position, not an image."""
+        tracks = _make_tracks_with_sides([("A", 2)])
+        out = dt_label.render_label(_height_release(), tracks, self.PROFILE,
+                                    False, probe=True)
+        assert isinstance(out, int)
 
 
 # ─── _chunk_continuous ────────────────────────────────────────────────────────
@@ -396,44 +449,73 @@ class TestChunkContinuous:
 
     def test_small_release_fits_one_chunk(self):
         tracks = _make_tracks_with_sides([("A", 4)])
-        chunks = _chunk_continuous(tracks, self.PROFILE)
+        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
         assert len(chunks) == 1
         assert chunks[0] == tracks
 
     def test_empty_tracks_empty_chunks(self):
-        chunks = _chunk_continuous([], self.PROFILE)
+        chunks = _chunk_continuous([], self.PROFILE, _height_release())
         assert chunks == []
 
     def test_overflow_creates_multiple_chunks(self):
         """A very large tracklist must be split across multiple labels."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE)
+        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
         assert len(chunks) > 1
 
     def test_all_tracks_preserved(self):
         """No tracks should be lost when splitting across chunks."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE)
+        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
         total = sum(len(c) for c in chunks)
         assert total == len(tracks)
 
     def test_chunk_order_preserved(self):
         """Tracks within and across chunks must stay in original order."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE)
+        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
         flat = [t for chunk in chunks for t in chunk]
         assert flat == tracks
 
     def test_each_chunk_fits_within_max_height(self):
         """Every produced chunk must fit within MAX_LABEL_HEIGHT_PX."""
         tracks = _make_tracks_with_sides([("A", 100)])
-        chunks = _chunk_continuous(tracks, self.PROFILE)
+        chunks = _chunk_continuous(tracks, self.PROFILE, _height_release())
         for i, chunk in enumerate(chunks):
-            h = _continuous_height(chunk, self.PROFILE, continuation=(i > 0))
+            h = _layout_height(_height_release(), chunk, self.PROFILE, False,
+                               continuation=(i > 0))
             assert h <= MAX_LABEL_HEIGHT_PX
 
 
 # ─── render_label ─────────────────────────────────────────────────────────────
+
+def _render_kwargs_for(release, tracks, profile, **kw):
+    """Continuous-profile render kwargs for a track list."""
+    if profile.get("feed") != "continuous":
+        return {}
+    return {"height_px": _layout_height(release, tracks, profile,
+                                        kw.get("is_compilation", False)),
+            "notes_lines": profile.get("notes_lines", 3)}
+
+
+def _ink(img):
+    """Count non-white pixels — a proxy for "something was actually drawn"."""
+    return sum(img.convert("L").histogram()[:200])
+
+
+def _bpm_zone(img, profile):
+    """Crop the right-hand BPM column, where BPM values are drawn."""
+    W = profile["width_px"]
+    M = profile["margin_px"]
+    BPM_ZONE_W = 110
+    return img.crop((W - M - BPM_ZONE_W, 0, W - M, img.height))
+
+
+def _qr_zone(img, profile):
+    """Crop the bottom-left corner where the QR is pasted."""
+    M = profile["margin_px"]
+    return img.crop((M, img.height - M - _QR_SIZE, M + _QR_SIZE, img.height - M))
+
 
 def _fake_render_track(position: str = "A1") -> MagicMock:
     """Build a minimal track mock suitable for render_label()."""
@@ -493,11 +575,11 @@ class TestRenderLabel:
         assert img.width  == 1200
         assert img.height == 1822
 
-    def test_continuous_height_matches_render(self):
-        """_continuous_height() returns the canvas height used by render_label()."""
+    def test_layout_height_matches_render(self):
+        """_layout_height() returns the canvas height render_label() then uses."""
         profile = LABEL_PROFILES["dk22243"]
         tracks = _make_render_tracks([("A", 2), ("B", 2)])
-        h = _continuous_height(tracks, profile)
+        h = _layout_height(_fake_render_release(), tracks, profile, False)
         img = render_label(
             _fake_render_release(), tracks, profile,
             is_compilation=False, height_px=h, notes_lines=profile["notes_lines"],
@@ -506,19 +588,30 @@ class TestRenderLabel:
         assert img.height == h
 
     def test_compilation_shows_track_artists(self):
-        """Smoke test: render_label() completes without error for a compilation."""
+        """A compilation must actually draw more ink than a non-compilation.
+
+        This previously only checked that render_label didn't raise, so it
+        would have passed even if artist names were never drawn.
+        """
         profile = LABEL_PROFILES["dk1247"]
         tracks = _make_render_tracks([("A", 3)])
-        render_label(_fake_render_release(), tracks, profile, is_compilation=True)
+        plain = render_label(_fake_render_release(), tracks, profile,
+                             is_compilation=False)
+        comp  = render_label(_fake_render_release(), tracks, profile,
+                             is_compilation=True)
+        assert _ink(comp) > _ink(plain)
 
     def test_bpm_values_appear_in_label(self):
-        """Passing a bpms dict does not cause render_label() to crash."""
+        """A supplied BPM must put ink in the BPM zone, not just avoid raising."""
         profile = LABEL_PROFILES["dk1247"]
         tracks = _make_render_tracks([("A", 2)])
         bpms = {0: {"bpm": 128, "duration_ms": 360000},
                 1: {"bpm": 132, "duration_ms": 420000}}
-        render_label(_fake_render_release(), tracks, profile,
-                     is_compilation=False, bpms=bpms)
+        without = render_label(_fake_render_release(), tracks, profile,
+                               is_compilation=False)
+        with_bpm = render_label(_fake_render_release(), tracks, profile,
+                                is_compilation=False, bpms=bpms)
+        assert _ink(_bpm_zone(with_bpm, profile)) > _ink(_bpm_zone(without, profile))
 
     def test_die_cut_does_not_wrap_tracks(self):
         """Die-cut labels use truncation, not wrapping — canvas height is fixed."""
@@ -562,109 +655,461 @@ def _fake_long_track(position: str, title: str, artist: str = "Artist",
 
 
 class TestQRPlacement:
-    """Verify the QR code never overlaps the track listing."""
+    """The QR must never overlap the track listing.
+
+    These used to re-derive the content bottom with a copy of the layout
+    arithmetic — the very duplication that caused the bugs. They now ask
+    render_label itself via probe mode, so there is nothing to keep in sync.
+    """
 
     PROFILE = LABEL_PROFILES["dk22243"]
     M       = LABEL_PROFILES["dk22243"]["margin_px"]
 
-    def _y_after_tracks(self, tracks_with_sides, release, is_compilation=False):
-        """Simulate the y cursor position after all track rows are rendered."""
-        from PIL import Image, ImageDraw
-        profile = self.PROFILE
-        W = profile["width_px"]
-        M = profile["margin_px"]
-        CW = W - 2 * M
-        BPM_ZONE_W = 110
-        POS_W = 90
-        TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
-        tmp = Image.new("RGB", (W, 100), "white")
-        draw = ImageDraw.Draw(tmp)
+    def _clearance(self, tracks, release=None, is_compilation=False, bpms=None):
+        """Pixels between the content bottom and the top of the QR."""
+        release = release or _fake_render_release()
+        h = _layout_height(release, tracks, self.PROFILE, is_compilation,
+                           bpms=bpms)
+        bottom = render_label(release, tracks, self.PROFILE, is_compilation,
+                              bpms=bpms, probe=True)
+        return (h - self.M - _QR_SIZE) - bottom, h
 
-        # Header y advancement (normal, 1-line title)
-        title_raw = release.getTitle()
-        f_t = dt_label._font_for("regular", 54, title_raw)
-        title_lines = dt_label.wrap_text(draw, title_raw, f_t, CW)
-        hdr_y = dt_label._HDR_H["normal"] + (len(title_lines) - 1) * dt_label._TITLE_WRAP_LINE_H
-        y = M + hdr_y
+    def test_qr_clears_tracks_short_release(self):
+        tracks = _make_render_tracks([("A", 2)])
+        clearance, _ = self._clearance(tracks)
+        assert clearance >= 0
 
-        current_side = object()
-        for side, idx, track in tracks_with_sides:
-            if side != current_side:
-                current_side = side
-                y += _SIDE_HDR_H
-            if is_compilation:
-                ts = (f"{dt_label._strip_disambig(track.getArtist())} – "
-                      f"{track.getTitle(synthesise=False)}")
-            else:
-                ts = track.getTitle(synthesise=False)
-            dur = track.getDuration()
-            dur_suffix = f" ({dur})" if dur else ""
-            f_tr = dt_label._font_for("regular", 38, ts)
-            lines = dt_label.wrap_text(draw, ts + dur_suffix, f_tr, TITLE_MAX_W)
-            y += _TRACK_ROW_H + (len(lines) - 1) * dt_label._EXTRA_LINE_H
-        return y
-
-    def _qr_top(self, h):
-        """qr_top as computed by render_label: bottom-anchored."""
-        return h - self.M - _QR_SIZE
-
-    def test_qr_below_tracks_short_release(self):
-        """QR code must not overlap tracks on a short release."""
-        profile = self.PROFILE
-        tracks = [("A", 0, _fake_long_track("A1", "Short Title", duration="3:00")),
-                  ("A", 1, _fake_long_track("A2", "Another Short Title", duration="4:00"))]
-        release = _fake_render_release()
-        extra = _measure_wrap_extra_px(tracks, profile, False, release=release)
-        h = _continuous_height(tracks, profile, extra_px=extra)
-        y_tracks = self._y_after_tracks(tracks, release)
-        qr_top = self._qr_top(h)
-        assert qr_top + _QR_SIZE <= h - self.M, \
-            f"QR ({qr_top}…{qr_top+_QR_SIZE}) overflows canvas bottom ({h - self.M})"
-        assert qr_top >= y_tracks + 28, \
-            f"QR top ({qr_top}) must be below the notes divider ({y_tracks + 28})"
-
-    def test_qr_below_tracks_many_wrapping(self):
-        """QR must not overlap tracks when many titles wrap to a second line.
-
-        This is a regression test for the r35722564 scenario where the QR code
-        overlapped the last track because _measure_wrap_extra_px underestimated
-        the extra height needed on borderline-width titles.  The _EXTRA_LINE_H
-        safety buffer in notes_h gives room for one extra undetected wrap.
-        """
-        profile = self.PROFILE
-        # Simulate a compilation with several long titles that wrap
+    def test_qr_clears_tracks_long_wrapping_titles(self):
         long_titles = [
-            ("A", 0, _fake_long_track("A1", "The Bug", "Hooked (Hyams Gym, Leytonstone)", "4:51")),
-            ("A", 1, _fake_long_track("A2", "Ghost Dubs", "In The Zone", "4:32")),
-            ("A", 2, _fake_long_track("A3", "The Bug", "Believers (Imperial Gardens, Camberwell)", "4:29")),
-            ("B", 3, _fake_long_track("B1", "Ghost Dubs", "Hope", "3:37")),
-            ("B", 4, _fake_long_track("B2", "The Bug", "Burial Skank (Mass, Brixton)", "3:38")),
-            ("B", 5, _fake_long_track("B3", "Ghost Dubs", "Dub Remote", "3:35")),
-            ("C", 6, _fake_long_track("C1", "The Bug", "Alien Virus (West Indian Centre, Leeds)", "4:48")),
-            ("C", 7, _fake_long_track("C2", "Ghost Dubs", "Down", "4:05")),
-            ("C", 8, _fake_long_track("C3", "The Bug", "Militants (The Rocket, Holloway)", "4:22")),
-            ("D", 9,  _fake_long_track("D1", "Ghost Dubs", "Into The Mystic", "4:25")),
-            ("D", 10, _fake_long_track("D2", "The Bug", "Dread (The End, London)", "5:00")),
-            ("D", 11, _fake_long_track("D3", "Ghost Dubs", "Midnight", "4:07")),
+            ("A", 0, _fake_long_track("A1", "The Bug", "Faith In Dub", "5:12")),
+            ("A", 1, _fake_long_track("A2", "Ghost Dubs",
+                                      "Descent Into The Maelstrom Of Endless Reverb", "6:01")),
+            ("B", 2, _fake_long_track("B1", "The Bug",
+                                      "Alien Virus (West Indian Centre, Leeds)", "4:48")),
+            ("B", 3, _fake_long_track("B2", "Ghost Dubs",
+                                      "Militants (The Rocket, Holloway) Extended", "4:22")),
         ]
-        release = _fake_render_release()
-        extra = _measure_wrap_extra_px(long_titles, profile, True, release=release)
-        h = _continuous_height(long_titles, profile, extra_px=extra)
-        y_tracks = self._y_after_tracks(long_titles, release, is_compilation=True)
-        qr_top = self._qr_top(h)
-        assert qr_top + _QR_SIZE <= h - self.M, \
-            f"QR overflows canvas: h={h}, extra_px={extra}"
-        # Even if one extra track wraps (50 px more than measured), QR must clear tracks
-        qr_top_worst = self._qr_top(h)   # qr_top doesn't change; notes_h absorbs the error
-        assert qr_top_worst >= y_tracks + 28 - dt_label._EXTRA_LINE_H, \
-            (f"QR top ({qr_top_worst}) too close to tracks ({y_tracks}); "
-             f"safety buffer insufficient")
+        clearance, _ = self._clearance(long_titles, is_compilation=True)
+        assert clearance >= 0
 
-    def test_notes_area_always_fits_qr(self):
-        """The notes area (notes_h) must always be large enough to contain the QR code."""
-        for profile in LABEL_PROFILES.values():
-            if profile.get("feed") != "continuous":
+    def test_qr_fits_within_canvas(self):
+        tracks = _make_render_tracks([("A", 3)])
+        _, h = self._clearance(tracks)
+        assert h - self.M - _QR_SIZE + _QR_SIZE <= h
+
+    def test_clearance_is_exactly_the_notes_gap(self):
+        """Canvas is sized precisely — no slack beyond the divider gap."""
+        tracks = _make_render_tracks([("A", 3)])
+        clearance, _ = self._clearance(tracks)
+        assert clearance == dt_label._NOTES_GAP
+
+    @pytest.mark.parametrize("counts", [
+        [("A", 1)], [("A", 4)], [("A", 3), ("B", 3)],
+        [("A", 2), ("B", 2), ("C", 2), ("D", 2)],
+    ])
+    def test_qr_clears_tracks_across_shapes(self, counts):
+        clearance, _ = self._clearance(_make_render_tracks(counts))
+        assert clearance >= 0
+
+
+# ─── Font glyph coverage / script fallback ───────────────────────────────────
+
+_DEVANAGARI = "दुनिया का राजा"   # r37718007 A2 — "King of the World"
+
+
+def _font_with(chars):
+    """Find any installed font covering every char in `chars`, else None.
+
+    Used to skip fallback tests on machines with no suitable font installed.
+    """
+    import glob
+    seen = set()
+    for pattern in ("/usr/share/fonts/**/*.ttf", "/usr/share/fonts/**/*.otf",
+                    "/System/Library/Fonts/**/*.ttf",
+                    "/System/Library/Fonts/**/*.ttc"):
+        for path in glob.glob(pattern, recursive=True):
+            if path in seen:
                 continue
-            notes_h = 28 + _QR_SIZE + dt_label._EXTRA_LINE_H
-            assert notes_h >= 28 + _QR_SIZE, \
-                f"notes_h {notes_h} too small for QR in profile {profile}"
+            seen.add(path)
+            try:
+                if not dt_label._missing_chars(path, chars):
+                    return path
+            except Exception:
+                continue
+    return None
+
+
+@pytest.fixture
+def clear_font_caches():
+    """Reset the module-level font caches around a test."""
+    def _clear():
+        dt_label._font_path_cache.clear()
+        dt_label._coverage_cache.clear()
+        dt_label._notdef_cache.clear()
+        dt_label._font_obj_cache.clear()
+        dt_label._warned_missing.clear()
+    _clear()
+    yield
+    _clear()
+
+
+class TestGlyphCoverage:
+    def test_latin_covered_by_primary(self):
+        path = dt_label._find_font_path("regular")
+        assert path, "no regular font installed"
+        assert dt_label._missing_chars(path, "Angel Edit") == []
+
+    def test_devanagari_not_covered_by_latin_face(self):
+        """The bug: Arial/Liberation have no Devanagari glyphs."""
+        path = dt_label._find_font_path("regular")
+        missing = dt_label._missing_chars(path, _DEVANAGARI)
+        assert missing, "expected Devanagari to be missing from the Latin face"
+        assert "द" in missing
+
+    def test_whitespace_always_covered(self):
+        path = dt_label._find_font_path("regular")
+        assert dt_label._covers(path, " ") is True
+        assert dt_label._missing_chars(path, "   ") == []
+
+    def test_coverage_is_cached(self, clear_font_caches):
+        path = dt_label._find_font_path("regular")
+        dt_label._covers(path, "A")
+        assert (path, "A") in dt_label._coverage_cache
+
+
+class TestFontFallback:
+    def test_latin_text_keeps_primary_face(self, clear_font_caches):
+        font = dt_label._font_for("regular", 38, "Angel Edit")
+        assert font.path == dt_label._find_font_path("regular")
+
+    def test_falls_back_to_face_with_glyphs(self, clear_font_caches):
+        """A face covering the string must be chosen over the Latin primary."""
+        good = _font_with(_DEVANAGARI)
+        if not good:
+            pytest.skip("no Devanagari-capable font installed")
+        dt_label._FONT_CANDIDATES["devanagari"] = [good]
+        dt_label._font_path_cache.clear()
+        font = dt_label._font_for("regular", 38, _DEVANAGARI)
+        assert dt_label._missing_chars(font.path, _DEVANAGARI) == []
+
+    def test_mixed_script_needs_whole_string_coverage(self, clear_font_caches):
+        """Fallback must cover Latin too — Pillow draws the run in one face."""
+        mixed = _DEVANAGARI + " (Original Mix)"
+        good = _font_with(mixed)
+        if not good:
+            pytest.skip("no font covering both scripts installed")
+        dt_label._FONT_CANDIDATES["devanagari"] = [good]
+        dt_label._font_path_cache.clear()
+        font = dt_label._font_for("regular", 38, mixed)
+        assert dt_label._missing_chars(font.path, mixed) == []
+
+    def test_warns_once_when_nothing_covers(self, clear_font_caches, capsys):
+        """Unrenderable text warns on stderr but still returns a usable font."""
+        for style in dt_label._FALLBACK_ORDER:
+            dt_label._FONT_CANDIDATES[style] = []
+        dt_label._font_path_cache.clear()
+        font = dt_label._font_for("regular", 38, _DEVANAGARI)
+        assert font is not None
+        err = capsys.readouterr().err
+        assert "U+0926" in err
+
+        dt_label._font_for("regular", 38, _DEVANAGARI)
+        assert capsys.readouterr().err == ""   # deduped, no repeat warning
+
+    def test_empty_and_non_string_are_safe(self, clear_font_caches):
+        assert dt_label._font_for("regular", 38, "") is not None
+        assert dt_label._font_for("regular", 38, None) is not None
+
+
+# ─── Printer send ─────────────────────────────────────────────────────────────
+
+import time
+import threading
+
+
+def _fake_printer(hold=0.0):
+    """Throwaway TCP server that accepts a job and says nothing. Returns port."""
+    import socket as _s
+    srv = _s.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            time.sleep(hold)
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+
+class TestPrinterSend:
+    """The printer does not report completion over the network.
+
+    Probed for 10s on port 9100: zero bytes back.  So _send_raster writes and
+    returns, and "sent to printer" is the last observable step.
+    """
+
+    def test_writes_and_returns(self):
+        pytest.importorskip("brother_ql")
+        port = _fake_printer()
+        assert dt_label._send_raster(b"\x00" * 400,
+                                     f"tcp://127.0.0.1:{port}") is None
+
+    def test_returns_promptly(self):
+        """No readback wait: a silent printer must not stall the caller."""
+        pytest.importorskip("brother_ql")
+        port = _fake_printer(hold=2.0)
+        started = time.time()
+        dt_label._send_raster(b"\x00" * 400, f"tcp://127.0.0.1:{port}")
+        assert time.time() - started < 0.5
+
+    def test_write_failure_raises(self):
+        """A dead port must raise so print_label can turn it into RuntimeError."""
+        pytest.importorskip("brother_ql")
+        with pytest.raises(OSError):
+            dt_label._send_raster(b"\x00" * 400, "tcp://127.0.0.1:1")
+
+    def test_partially_written_blocks_retry(self):
+        """A mid-transfer timeout must not be treated as safely retryable."""
+        assert dt_label._partially_written(TimeoutError("timed out")) is True
+
+    def test_connection_error_is_retryable(self):
+        assert dt_label._partially_written(ConnectionRefusedError()) is False
+
+
+# ─── Config-only CLI invocations ──────────────────────────────────────────────
+
+class TestConfigOnlyInvocation:
+    """`dt_label --printer …` with no release must save config and exit 0.
+
+    Argument validation used to run before the config save, so a config-setting
+    flag on its own bailed out with "provide a release ID" and saved nothing.
+    """
+
+    def _run(self, argv, cfg_path):
+        """Run dt_label.main() with argv, redirecting config I/O to cfg_path.
+
+        util.datapath is resolved at import time, so patching HOME is too late;
+        userfile itself has to be replaced.
+        """
+        with patch.object(sys, "argv", ["dt_label"] + argv), \
+             patch.object(dt_label.util, "userfile", lambda _n: cfg_path):
+            with pytest.raises(SystemExit) as exc:
+                dt_label.main()
+        return exc.value.code
+
+    def test_printer_alone_saves_and_exits_zero(self, tmp_path):
+        cfg = str(tmp_path / "label_config")
+        assert self._run(["--printer", "tcp://printer.local:9100"], cfg) == 0
+        assert "printer=tcp://printer.local:9100" in open(cfg).read()
+
+    def test_model_and_profile_alone_saved(self, tmp_path):
+        cfg = str(tmp_path / "label_config")
+        assert self._run(["--model", "QL-1110NWB",
+                          "--label-profile", "dk22243"], cfg) == 0
+        body = open(cfg).read()
+        assert "model=QL-1110NWB" in body
+        assert "profile=dk22243" in body
+
+    def test_settings_merge_across_invocations(self, tmp_path):
+        """A later config-only call must not clobber earlier keys."""
+        cfg = str(tmp_path / "label_config")
+        self._run(["--printer", "tcp://a.local:9100"], cfg)
+        self._run(["--model", "QL-800"], cfg)
+        body = open(cfg).read()
+        assert "printer=tcp://a.local:9100" in body
+        assert "model=QL-800" in body
+
+    def test_no_args_still_errors(self, tmp_path):
+        cfg = str(tmp_path / "label_config")
+        assert self._run([], cfg) == 2          # argparse usage error
+        assert not os.path.exists(cfg)          # and writes nothing
+
+    def test_release_id_and_file_still_mutually_exclusive(self, tmp_path):
+        cfg = str(tmp_path / "label_config")
+        assert self._run(["123", "-f", "ids.txt"], cfg) == 2
+
+
+# ─── QR placement (property tests) ────────────────────────────────────────────
+
+def _qr_track(pos, title, artist="Artist", duration=None):
+    t = MagicMock()
+    t.__getitem__ = MagicMock(side_effect=lambda k, _p=pos: _p if k == "position" else "")
+    t.getArtist.return_value = artist
+    t.getTitle.return_value = title
+    t.getDuration.return_value = duration
+    return t
+
+
+def _qr_release(rid=4884361, title="Reconstructed", artist="Steve O'Sullivan"):
+    r = MagicMock()
+    for name, val in [("getId", rid), ("getTitle", title), ("getArtist", artist),
+                      ("getLabel", "Sushitech Records"), ("getCatno", "SUSH28"),
+                      ("getYear", "2013"), ("getLabelYear", "2013"),
+                      ("getFormat", '2 x 12"'), ("getCountry", "Germany"),
+                      ("getGenre", "Electronic"), ("getStyle", "Dub Techno"),
+                      ("getNotes", "")]:
+        getattr(r, name).return_value = val
+    r.isCompilation.return_value = False
+    return r
+
+
+# r4884361 — bare side letters, long remix titles, no Discogs durations.
+# Beatport supplies durations, whose suffix pushes two titles onto a second
+# line. The measurement pass used not to see them, so the predicted canvas was
+# 100 px short and the bottom-anchored QR landed on the D2 row.
+_RECONSTRUCTED = [
+    ("A",  "Where's Burt? (Delano Smith Reconstruction)"),
+    ("B",  "Moving Forward (Mike Huckaby S Y N T H Reconstruction)"),
+    ("C",  "Where's Burt? (Thor Reconstruction)"),
+    ("D1", "Don't Rush The Dub (Rhauder Reconstruction)"),
+    ("D2", "Stripped (Exos Reconstruction)"),
+]
+_RECONSTRUCTED_BPMS = {
+    0: {"bpm": 125, "duration_ms": 463000},
+    1: {"bpm": 123, "duration_ms": 481000},
+    2: {"bpm": 120, "duration_ms": 428000},
+    3: {"bpm": 126, "duration_ms": 417000},
+    4: {"bpm": 122, "duration_ms": 399000},
+}
+
+
+def _content_bottom_vs_qr(tracks, bpms, is_compilation=False, release=None):
+    """Render a continuous label; return (overrun_px, height).
+
+    overrun_px > 0 means the track listing crossed into the QR zone. Both the
+    content bottom and the canvas height come from the same layout code, so
+    this measures the real thing rather than re-deriving it.
+    """
+    profile = LABEL_PROFILES["dk22243"]
+    release = release or _qr_release()
+    tws = [(dt_label.get_side(p), i, _qr_track(p, t))
+           for i, (p, t) in enumerate(tracks)]
+    kw = dt_label._render_kwargs(tws, profile, release=release,
+                                 is_compilation=is_compilation, bpms=bpms)
+    H = kw["height_px"]
+    qr_top = H - profile["margin_px"] - _QR_SIZE
+    content_bottom = dt_label.render_label(release, tws, profile, is_compilation,
+                                           bpms=bpms, probe=True)
+    return content_bottom - qr_top, H
+
+
+class TestQRPlacementProperties:
+    """The QR is bottom-anchored, so it lands correctly only if the predicted
+    canvas height matches what render_label actually lays out. Every QR bug so
+    far has been a divergence between those two. Assert the property directly.
+    """
+
+    def test_reconstructed_qr_does_not_overlap_tracks(self):
+        overrun, _ = _content_bottom_vs_qr(_RECONSTRUCTED, _RECONSTRUCTED_BPMS)
+        assert overrun <= 0, f"QR overlaps track listing by {overrun}px"
+
+    def test_beatport_duration_included_in_height(self):
+        """Durations that only exist in Beatport data must affect the canvas."""
+        _, h_without = _content_bottom_vs_qr(_RECONSTRUCTED, None)
+        _, h_with    = _content_bottom_vs_qr(_RECONSTRUCTED, _RECONSTRUCTED_BPMS)
+        assert h_with > h_without, \
+            "duration suffix did not grow the canvas — measurement ignores bpms"
+
+    def test_resolver_shared_between_measure_and_render(self):
+        """_resolve_track_text is the single source of truth for row text."""
+        tr = _qr_track("A1", "Title", duration=None)
+        assert dt_label._resolve_track_text(tr, 0, False, None) == "Title"
+        # Beatport fallback applies when Discogs has no duration
+        assert dt_label._resolve_track_text(
+            tr, 0, False, {0: {"duration_ms": 463000}}) == "Title (7:43)"
+        # Discogs duration wins over Beatport
+        tr2 = _qr_track("A1", "Title", duration="3:00")
+        assert dt_label._resolve_track_text(
+            tr2, 0, False, {0: {"duration_ms": 463000}}) == "Title (3:00)"
+
+    def test_compilation_prefixes_artist(self):
+        tr = _qr_track("A1", "Title", artist="Someone (2)")
+        out = dt_label._resolve_track_text(tr, 0, True, None)
+        assert out.startswith("Someone – ")   # disambiguation stripped
+
+    @pytest.mark.parametrize("n", [1, 3, 5, 8, 12])
+    def test_qr_never_overlaps_for_varied_lengths(self, n):
+        """Property: for any track count, content must stay above the QR."""
+        tracks = [(f"A{i+1}",
+                   "A Fairly Long Reconstruction Title That May Well Wrap "
+                   f"Around Number {i+1}")
+                  for i in range(n)]
+        bpms = {i: {"bpm": 120, "duration_ms": 400000 + i} for i in range(n)}
+        overrun, _ = _content_bottom_vs_qr(tracks, bpms)
+        assert overrun <= 0, f"{n} tracks: QR overlaps by {overrun}px"
+
+
+# ─── Rendered output content ──────────────────────────────────────────────────
+
+class TestRenderedContent:
+    """Assertions on what actually lands on the canvas.
+
+    The suite used to render images and never inspect them, which is how a QR
+    printing on top of the track listing survived three separate fixes.
+    """
+
+    PROFILE = LABEL_PROFILES["dk22243"]
+
+    def _render(self, tracks, **kw):
+        release = _fake_render_release()
+        kwargs = _render_kwargs_for(release, tracks, self.PROFILE, **kw)
+        return render_label(release, tracks, self.PROFILE, kw.get("is_compilation", False),
+                            **kwargs)
+
+    def test_qr_zone_is_not_blank(self):
+        img = self._render(_make_render_tracks([("A", 2)]))
+        assert _ink(_qr_zone(img, self.PROFILE)) > 500, "QR appears to be missing"
+
+    def test_qr_zone_contains_black_and_white(self):
+        """A QR is a mix of both; a solid block would mean a paste failure."""
+        img = self._render(_make_render_tracks([("A", 2)]))
+        zone = _qr_zone(img, self.PROFILE).convert("L")
+        hist = zone.histogram()
+        dark  = sum(hist[:128])
+        total = sum(hist)
+        assert 0.1 < dark / total < 0.9
+
+    def test_more_tracks_means_more_ink(self):
+        few  = self._render(_make_render_tracks([("A", 2)]))
+        many = self._render(_make_render_tracks([("A", 6)]))
+        assert _ink(many) > _ink(few)
+
+    def test_blank_bpm_zone_when_no_bpms(self):
+        """Without BPMs the zone holds only the thin write-line rules."""
+        img = self._render(_make_render_tracks([("A", 3)]))
+        zone_ink = _ink(_bpm_zone(img, self.PROFILE))
+        assert zone_ink < _ink(img) * 0.2
+
+    def test_track_area_above_qr_is_untouched_by_it(self):
+        """The band just above the QR must stay clear — the r4884361 failure.
+
+        If the canvas is undersized the QR is pasted over the last track row,
+        which shows up as ink where the notes gap should be blank.
+        """
+        tracks = _make_render_tracks([("A", 4)])
+        release = _fake_render_release()
+        h = _layout_height(release, tracks, self.PROFILE, False)
+        img = render_label(release, tracks, self.PROFILE, False,
+                           height_px=h, notes_lines=self.PROFILE["notes_lines"])
+        bottom = render_label(release, tracks, self.PROFILE, False, probe=True)
+        qr_top = h - self.PROFILE["margin_px"] - _QR_SIZE
+        # The strip between content bottom and qr_top holds only the divider.
+        strip = img.crop((self.PROFILE["margin_px"], bottom + 4,
+                          self.PROFILE["margin_px"] + _QR_SIZE, qr_top))
+        assert strip.height > 0
+        # The strip holds the notes divider and nothing else. A QR pasted here
+        # would be orders of magnitude denser, so compare against one.
+        assert _ink(strip) < _ink(_qr_zone(img, self.PROFILE)) * 0.1
+
+    def test_die_cut_canvas_is_exactly_the_profile_size(self):
+        profile = LABEL_PROFILES["dk1247"]
+        img = render_label(_fake_render_release(),
+                           _make_render_tracks([("A", 3)]), profile, False)
+        assert (img.width, img.height) == (profile["width_px"], profile["height_px"])

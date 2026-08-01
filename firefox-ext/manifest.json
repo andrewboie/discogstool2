@@ -1,9 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Discogs Label Printer",
-  "version": "1.9",
+  "version": "2.3",
   "description": "Print dt_label vinyl sleeve labels from Discogs release pages",
-
   "permissions": [
     "activeTab",
     "menus",
@@ -11,11 +10,11 @@
     "storage",
     "tabs"
   ],
-
   "background": {
-    "scripts": ["background.js"]
+    "scripts": [
+      "background.js"
+    ]
   },
-
   "browser_action": {
     "default_icon": {
       "16": "icons/icon-16.png",
@@ -25,12 +24,10 @@
     "default_popup": "popup.html",
     "default_title": "Print Label"
   },
-
   "icons": {
     "48": "icons/icon-48.png",
     "96": "icons/icon-96.png"
   },
-
   "browser_specific_settings": {
     "gecko": {
       "id": "discogs-label-printer@discogstool2",

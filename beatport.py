@@ -34,7 +34,7 @@ import time
 import unicodedata
 from abc import ABC, abstractmethod
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Callable, TypedDict, cast
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -150,9 +150,31 @@ BPM_VERIFY_MAX: float = 250.0
 
 # ── Auth config path ───────────────────────────────────────────────────────────
 
-AUTH_FILE    = util.userfile("beatport_auth.json")
-CACHE_FILE   = util.userfile("beatport.db")
-_LOG_FILE    = util.userfile("beatport.log")
+# Paths are resolved per call rather than at import.  As module constants they
+# ran util.userfile() at import time, which both created ~/.discogstool as an
+# import side effect and froze $HOME before any test could redirect it.
+
+def auth_file() -> str:
+    return util.userfile("beatport_auth.json")
+
+
+def cache_file() -> str:
+    return util.userfile("beatport.db")
+
+
+def log_file() -> str:
+    return util.userfile("beatport.log")
+
+
+def __getattr__(name: str):
+    """Keep the historical module-level path constants working (PEP 562)."""
+    if name == "AUTH_FILE":
+        return auth_file()
+    if name == "CACHE_FILE":
+        return cache_file()
+    if name == "_LOG_FILE":
+        return log_file()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── File logger ───────────────────────────────────────────────────────────────
@@ -175,7 +197,7 @@ def _attach_file_logger() -> None:
     _file_handler_attached = True
 
     handler = logging.handlers.RotatingFileHandler(
-        _LOG_FILE,
+        log_file(),
         maxBytes=2 * 1024 * 1024,  # 2 MB per file
         backupCount=2,              # → .log  .log.1  .log.2  (max 6 MB)
         encoding="utf-8",
@@ -296,8 +318,10 @@ class BeatportCache:
         appears on Beatport).
     """
 
-    def __init__(self, db_path: str = CACHE_FILE) -> None:
-        self._conn = sqlite3.connect(db_path)
+    def __init__(self, db_path: str | None = None) -> None:
+        # Resolved here, not as a default argument — defaults are evaluated at
+        # import, which is exactly the side effect being removed.
+        self._conn = sqlite3.connect(cache_file() if db_path is None else db_path)
         self._conn.row_factory = sqlite3.Row
         self._create_schema()
 
@@ -729,19 +753,21 @@ def _authorize(username: str, password: str, client_id: str) -> BeatportAuth:
 
 def _load_auth() -> BeatportAuth | None:
     """Load auth config from disk. Returns None if file missing or malformed."""
-    if not os.path.exists(AUTH_FILE):
+    path = auth_file()
+    if not os.path.exists(path):
         return None
     try:
-        with open(AUTH_FILE) as f:
+        with open(path) as f:
             return cast(BeatportAuth, json.load(f))
     except (json.JSONDecodeError, OSError):
         return None
 
 
 def _save_auth(data: BeatportAuth) -> None:
-    with open(AUTH_FILE, "w") as f:
+    path = auth_file()
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
-    os.chmod(AUTH_FILE, 0o600)
+    os.chmod(path, 0o600)
 
 
 def get_client() -> _BeatportClient:
@@ -1195,10 +1221,7 @@ class AnthropicMatcher(ReleaseMatcher):
 
     def __init__(self) -> None:
         auth = _load_auth() or {}
-        self._api_key: str | None = (
-            auth.get("anthropic_api_key")
-            or os.environ.get("ANTHROPIC_API_KEY")
-        )
+        self._api_key: str | None = util.resolve_anthropic_key()
         self._model: str = auth.get("anthropic_model") or self._DEFAULT_MODEL
 
     def is_available(self) -> bool:
@@ -1609,6 +1632,7 @@ def _verify_bpms(
     track_data: dict[int, dict],
     cache: BeatportCache,
     force: bool = False,
+    progress: "Callable[[str, int, int], None] | None" = None,
 ) -> dict[int, dict[str, int | None]]:
     """Determine BPMs from local Essentia analysis of Beatport preview audio.
 
@@ -1632,9 +1656,17 @@ def _verify_bpms(
         BeatportCache instance for reading/writing bpm_verified entries.
     force:
         If True, ignore cached verification results and re-analyze.
+    progress:
+        Optional callback ``fn(stage, done, total)`` where stage is
+        ``"samples"`` (preview download) or ``"bpm"`` (Essentia analysis).
+        Only tracks that actually need work are counted, so a fully cached
+        release reports nothing.
     """
-    import tempfile
-    import essentia.standard as es  # type: ignore[import-untyped]
+    # Pass 1: consume transient keys, resolve cache hits, and collect the
+    # tracks that genuinely need downloading/analysing.  Doing this first
+    # gives an accurate total for progress reporting and lets us skip the
+    # (slow) essentia import entirely when everything is cached.
+    pending: list[tuple[int, str, str, int | None]] = []
 
     for idx, entry in track_data.items():
         declared_bpm = entry.get("bpm")   # stored for diagnostics; not used in decision
@@ -1660,14 +1692,50 @@ def _verify_bpms(
                 entry["bpm"] = detail["chosen_bpm"]  # int or None
                 continue
 
-        # Download preview MP3 and run Essentia
+        pending.append((idx, sample_url, bp_track_id, declared_bpm))
+
+    if not pending:
+        return _strip_transient_keys(track_data)
+
+    import essentia.standard as es  # type: ignore[import-untyped]
+
+    total = len(pending)
+
+    def _report(stage: str, done: int) -> None:
+        if progress is not None:
+            try:
+                progress(stage, done, total)
+            except Exception:   # progress must never break a print job
+                pass
+
+    _report("samples", 0)
+    _report("bpm", 0)
+
+    for n, (idx, sample_url, bp_track_id, declared_bpm) in enumerate(pending, 1):
+        entry = track_data[idx]
+
+        # Stage 1: download the preview MP3.
         try:
-            detected_bpm, confidence = _analyze_preview(sample_url, es)
+            mp3_bytes = _download_preview(sample_url)
+        except Exception as e:
+            log.warning("BPM detect: track [%d] download failed: %s — no BPM", idx, e)
+            cache.put_verified_bpm(
+                bp_track_id, sample_url, declared_bpm or 0, 0.0, 0.0, None,
+            )
+            _report("samples", n)
+            _report("bpm", n)
+            continue
+        _report("samples", n)
+
+        # Stage 2: run Essentia over it.
+        try:
+            detected_bpm, confidence = _detect_bpm(mp3_bytes, es)
         except Exception as e:
             log.warning("BPM detect: track [%d] analysis failed: %s — no BPM", idx, e)
             cache.put_verified_bpm(
                 bp_track_id, sample_url, declared_bpm or 0, 0.0, 0.0, None,
             )
+            _report("bpm", n)
             continue
 
         chosen_bpm = _accept_detected_bpm(detected_bpm, confidence)
@@ -1675,25 +1743,27 @@ def _verify_bpms(
         cache.put_verified_bpm(
             bp_track_id, sample_url, declared_bpm or 0, detected_bpm, confidence, chosen_bpm,
         )
+        _report("bpm", n)
 
     return _strip_transient_keys(track_data)
 
 
-def _analyze_preview(
-    sample_url: str,
-    es: object,
-) -> tuple[float, float]:
-    """Download a preview MP3 and return (bpm, confidence) from Essentia.
+def _download_preview(sample_url: str) -> bytes:
+    """Fetch a Beatport preview MP3.  Raises on download failure."""
+    resp = requests.get(sample_url, timeout=_HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.content
 
-    Raises on download or analysis failure.
+
+def _detect_bpm(mp3_bytes: bytes, es: object) -> tuple[float, float]:
+    """Run Essentia on preview audio; return (bpm, confidence).
+
+    Raises on analysis failure.
     """
     import tempfile
 
-    resp = requests.get(sample_url, timeout=_HTTP_TIMEOUT)
-    resp.raise_for_status()
-
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as tmp:
-        tmp.write(resp.content)
+        tmp.write(mp3_bytes)
         tmp.flush()
 
         audio = es.MonoLoader(filename=tmp.name, sampleRate=44100)()  # type: ignore[attr-defined]
@@ -1702,6 +1772,18 @@ def _analyze_preview(
         )
 
     return float(bpm), float(confidence)
+
+
+def _analyze_preview(
+    sample_url: str,
+    es: object,
+) -> tuple[float, float]:
+    """Download a preview MP3 and return (bpm, confidence) from Essentia.
+
+    Retained as a convenience wrapper; ``_verify_bpms`` calls the two halves
+    separately so download and analysis can be reported as distinct stages.
+    """
+    return _detect_bpm(_download_preview(sample_url), es)
 
 
 def _strip_transient_keys(
@@ -1788,6 +1870,7 @@ class BeatportMatcher:
         force: bool = False,
         verify: bool = True,
         reverify: bool = False,
+        progress: "Callable[[str, int, int], None] | None" = None,
     ) -> dict[int, dict[str, int | None]]:
         """Find BPMs and durations for all tracks in a Discogs release.
 
@@ -1802,6 +1885,9 @@ class BeatportMatcher:
             audio analysis of the preview MP3 using Essentia.
         reverify:
             If True, ignore cached BPM verification results and re-analyze.
+        progress:
+            Optional callback ``fn(stage, done, total)`` reporting preview
+            download ("samples") and Essentia analysis ("bpm") progress.
 
         Returns
         -------
@@ -1841,7 +1927,7 @@ class BeatportMatcher:
             )
             return self._resolve_bpms(
                 discogs_release, beatport_id, client,
-                verify=verify, reverify=reverify,
+                verify=verify, reverify=reverify, progress=progress,
             )
 
         # Check cached nomatch (no point running matchers again if we recently failed)
@@ -1890,7 +1976,7 @@ class BeatportMatcher:
         self._cache.put_match(discogs_id, beatport_id, best_confidence, winning_matcher)
         return self._resolve_bpms(
             discogs_release, beatport_id, client,
-            verify=verify, reverify=reverify,
+            verify=verify, reverify=reverify, progress=progress,
         )
 
     def _resolve_bpms(
@@ -1900,6 +1986,7 @@ class BeatportMatcher:
         client: _BeatportClient | None = None,
         verify: bool = True,
         reverify: bool = False,
+        progress: "Callable[[str, int, int], None] | None" = None,
     ) -> dict[int, dict[str, int | None]]:
         """Fetch Beatport tracks, fuzzy-match to Discogs tracks, and verify BPMs."""
         if client is None:
@@ -1921,7 +2008,8 @@ class BeatportMatcher:
         result = _match_tracks(discogs_release, beatport_tracks)
 
         if verify:
-            result = _verify_bpms(result, self._cache, force=reverify)
+            result = _verify_bpms(result, self._cache, force=reverify,
+                                  progress=progress)
         else:
             result = _strip_transient_keys(result)
 
@@ -1935,7 +2023,7 @@ class BeatportMatcher:
 def _setup_credentials() -> None:
     """Interactive setup to store Beatport credentials."""
     print("Beatport credential setup")
-    print("Credentials are stored in:", AUTH_FILE)
+    print("Credentials are stored in:", auth_file())
     print()
 
     auth: BeatportAuth = _load_auth() or cast(BeatportAuth, {})

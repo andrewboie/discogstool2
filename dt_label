@@ -21,6 +21,8 @@ import sys
 import os
 import re
 import time
+import json
+import socket
 import argparse
 import logging
 
@@ -34,13 +36,42 @@ import qrcode
 
 log = logging.getLogger(__name__)
 
+# ── Progress reporting ────────────────────────────────────────────────────────
+# When --progress is given, machine-readable events are written to stdout on
+# their own lines, each prefixed with _PROGRESS_PREFIX.  dt_server parses these
+# to drive the extension's stage display; humans running dt_label directly see
+# nothing extra unless they ask for it.  Keeping the events on stdout (rather
+# than a side channel) means `dt_label --progress` is trivially debuggable.
+
+_PROGRESS_PREFIX = "@@DTP@@ "
+_progress_on = False
+
+# Stage identifiers, in the order the UI displays them.
+STAGES = ("lookup", "samples", "bpm", "render", "print")
+
+
+def emit(stage, state, **fields):
+    """Write one progress event, if --progress is active.
+
+    state is one of: "start", "progress", "done", "skip", "error".
+    """
+    if not _progress_on:
+        return
+    event = {"stage": stage, "state": state}
+    event.update(fields)
+    try:
+        sys.stdout.write(_PROGRESS_PREFIX + json.dumps(event, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass   # progress reporting must never break a print job
+
 
 # ── Label size profiles ───────────────────────────────────────────────────────
 
-# ── Shared layout constants (used by render_label AND _continuous_height) ─────
-# _continuous_height() predicts the pixel height that render_label() will
-# produce for a given track list.  Both functions use these constants — if
-# they ever diverge, test_continuous_height_matches_render will catch it.
+# ── Shared layout constants ───────────────────────────────────────────────────
+# render_label() is the single implementation of the layout.  _layout_height()
+# measures a real pass of it (probe mode) rather than predicting from these
+# constants, so there is no second implementation to drift out of sync.
 
 _TRACK_ROW_H  = 88   # px per track row
 _SIDE_HDR_H   = 44   # px for a side header row
@@ -60,8 +91,7 @@ _EXTRA_LINE_H = 50
 # (58 px between title lines; original 70 px spacing applies to the last line.)
 _TITLE_WRAP_LINE_H = 58
 
-# QR code size (px).  Used in both render_label() and _continuous_height() so the
-# two stay in sync.  ~17 mm at 300 DPI — scan-able from across a record shelf.
+# QR code size (px).  ~17 mm at 300 DPI — scannable from across a record shelf.
 _QR_SIZE = 200
 
 # Maximum label height for continuous stock — must fit on a 12" record sleeve.
@@ -104,25 +134,16 @@ CONFIG_FILE     = "label_config"
 
 def load_config():
     """Load saved printer/profile settings from ~/.discogstool/label_config."""
-    path = util.userfile(CONFIG_FILE)
-    config = {}
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    config[k.strip()] = v.strip()
-    return config
+    return util.load_kv_config(util.userfile(CONFIG_FILE))
 
 
 def save_config(config):
     """Persist printer/profile settings to ~/.discogstool/label_config."""
-    path = util.userfile(CONFIG_FILE)
-    with open(path, "w") as f:
-        f.write("# dt_label configuration — auto-updated by --printer / --model / --label-profile\n")
-        for k, v in config.items():
-            f.write(f"{k}={v}\n")
+    util.save_kv_config(
+        util.userfile(CONFIG_FILE), config,
+        header="dt_label configuration — auto-updated by "
+               "--printer / --model / --label-profile",
+    )
 
 
 # ── Font loading ──────────────────────────────────────────────────────────────
@@ -147,8 +168,9 @@ _FONT_CANDIDATES = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ],
-    # CJK fallback — used whenever text contains Japanese/Chinese/Korean characters.
-    # macOS ships Hiragino; Linux typically has Noto CJK.
+    # ── Script fallbacks ──────────────────────────────────────────────────
+    # Tried in _FALLBACK_ORDER whenever the primary (Latin) face has no glyph
+    # for some character.  macOS paths first, then common Linux locations.
     "cjk": [
         "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
@@ -156,7 +178,40 @@ _FONT_CANDIDATES = {
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ],
+    "devanagari": [
+        "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
+        "/System/Library/Fonts/Supplemental/ITFDevanagari.ttc",
+        "/System/Library/Fonts/Supplemental/DevanagariMT.ttc",
+        "/System/Library/Fonts/Kohinoor.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.otf",
+    ],
+    "thai": [
+        "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+        "/System/Library/Fonts/Thonburi.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    ],
+    "arabic": [
+        "/System/Library/Fonts/Supplemental/GeezaPro.ttc",
+        "/System/Library/Fonts/Supplemental/Geeza Pro.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    ],
+    "hebrew": [
+        "/System/Library/Fonts/Supplemental/ArialHB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Hebrew.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+    ],
+    # Very broad coverage — last resort before giving up.
+    "unicode": [
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    ],
 }
+
+# Order in which fallback faces are tried when the primary lacks a glyph.
+_FALLBACK_ORDER = ("cjk", "devanagari", "thai", "arabic", "hebrew", "unicode")
 
 _font_path_cache = {}
 
@@ -180,22 +235,107 @@ def make_font(style, size):
     return ImageFont.load_default()
 
 
-def _needs_cjk(text):
-    """Return True if text contains CJK, Hiragana, Katakana, or Hangul characters."""
-    return any(
-        0x2E80 <= ord(ch) <= 0x9FFF or  # CJK radicals, Hiragana, Katakana, CJK Unified
-        0xAC00 <= ord(ch) <= 0xD7FF or  # Hangul syllables
-        0xF900 <= ord(ch) <= 0xFAFF     # CJK Compatibility ideographs
-        for ch in text
-    )
+# Glyph coverage does not depend on point size, so probe once at a fixed size
+# and cache the answer per (font path, character).
+_PROBE_SIZE = 40
+
+_font_obj_cache = {}    # (path, size) -> ImageFont
+_coverage_cache = {}    # (path, char) -> bool
+_notdef_cache   = {}    # path -> glyph signature of a guaranteed-absent char
+_warned_missing = set() # strings already warned about, to avoid log spam
+
+
+def _load_font(path, size):
+    """Load and cache a TrueType face."""
+    key = (path, size)
+    font = _font_obj_cache.get(key)
+    if font is None:
+        font = ImageFont.truetype(path, size)
+        _font_obj_cache[key] = font
+    return font
+
+
+def _glyph_sig(font, ch):
+    """Rasterise one character; return (size, bytes) or None if it won't render."""
+    try:
+        mask = font.getmask(ch, mode="1")
+    except Exception:
+        return None
+    return (mask.size, bytes(mask))
+
+
+def _covers(path, ch):
+    """True if the face at `path` has a real glyph for `ch`.
+
+    Works by rasterising the character and comparing it against the face's
+    .notdef box, probed with U+FFFE — a permanent noncharacter that no font
+    is allowed to map, so it always yields .notdef.  Whitespace is always
+    treated as covered.
+    """
+    if ch.isspace():
+        return True
+    key = (path, ch)
+    cached = _coverage_cache.get(key)
+    if cached is not None:
+        return cached
+
+    font   = _load_font(path, _PROBE_SIZE)
+    notdef = _notdef_cache.get(path)
+    if notdef is None:
+        notdef = _glyph_sig(font, "￾")
+        _notdef_cache[path] = notdef
+
+    sig = _glyph_sig(font, ch)
+    ok  = sig is not None and sig != notdef
+    _coverage_cache[key] = ok
+    return ok
+
+
+def _missing_chars(path, text):
+    """Characters of `text` that the face at `path` cannot render (deduped)."""
+    return [ch for ch in dict.fromkeys(text) if not _covers(path, ch)]
 
 
 def _font_for(style, size, text):
-    """Like make_font but upgrades to the CJK font when text requires it."""
-    if _needs_cjk(text):
-        path = _find_font_path("cjk")
-        if path:
-            return ImageFont.truetype(path, size)
+    """Return a font that can actually render `text`.
+
+    Prefers the requested style.  If that face is missing glyphs, walks
+    _FALLBACK_ORDER and returns the first face covering the *entire* string —
+    whole-string coverage matters because Pillow draws the run in one face, so
+    a fallback that fixes the Devanagari but drops the Latin is no better.
+
+    If nothing covers everything, uses whichever face covers the most and warns
+    once on stderr about the characters that will print as boxes.
+    """
+    if not isinstance(text, str) or not text:
+        return make_font(style, size)
+
+    primary = _find_font_path(style)
+    if primary and not _missing_chars(primary, text):
+        return make_font(style, size)
+
+    best_path    = primary
+    best_missing = (_missing_chars(primary, text) if primary
+                    else list(dict.fromkeys(text)))
+
+    for fb_style in _FALLBACK_ORDER:
+        path = _find_font_path(fb_style)
+        if not path:
+            continue
+        missing = _missing_chars(path, text)
+        if not missing:
+            return _load_font(path, size)
+        if best_path is None or len(missing) < len(best_missing):
+            best_path, best_missing = path, missing
+
+    if best_missing and text not in _warned_missing:
+        _warned_missing.add(text)
+        codes = " ".join(f"U+{ord(c):04X}" for c in best_missing)
+        print(f"  Warning: no installed font renders {codes} in {text!r}; "
+              f"these will print as boxes.", file=sys.stderr)
+
+    if best_path:
+        return _load_font(best_path, size)
     return make_font(style, size)
 
 
@@ -313,82 +453,71 @@ def hline(draw, y, x0, x1, color="black", weight=2):
 
 # ── Label rendering ───────────────────────────────────────────────────────────
 
-def _measure_wrap_extra_px(tracks_with_sides, profile, is_compilation,
-                           release=None, continuation=False):
-    """Return the total extra canvas px caused by text wrapping.
+def _resolve_track_text(track, track_idx, is_compilation, bpms=None):
+    """Return the exact string rendered for one track row, duration included.
 
-    Accounts for:
-      * Track titles that spill onto a second line (each adds _EXTRA_LINE_H px).
-      * The release title wrapping to a second line in the main header
-        (adds _TITLE_WRAP_LINE_H px per extra line; skipped for continuation
-        headers, which always truncate rather than wrap).
+    This is the single source of truth for what a row contains.  The height
+    calculation and the renderer must agree on it exactly: if one appends a
+    duration the other doesn't know about, the extra text can push a title onto
+    a second line, the predicted canvas comes up short, and the bottom-anchored
+    QR code lands on top of the track listing.  That is precisely how the
+    Beatport duration fallback misplaced the QR on r4884361.
+
+    Returns None for stub/mock tracks whose title isn't a string.
     """
-    from PIL import Image, ImageDraw
-    W = profile["width_px"]
-    M = profile["margin_px"]
-    CW = W - 2 * M
-    BPM_ZONE_W = 110
-    POS_W      = 90
-    TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
+    if is_compilation:
+        title = track.getTitle(synthesise=False)
+        if not isinstance(title, str):
+            return None
+        text = f"{_strip_disambig(track.getArtist())} – {title}"
+    else:
+        text = track.getTitle(synthesise=False)
+        if not isinstance(text, str):
+            return None
 
-    tmp = Image.new("RGB", (W, 100), "white")
-    draw = ImageDraw.Draw(tmp)
+    # Prefer the Discogs duration; fall back to Beatport's length_ms.
+    dur = track.getDuration()
+    if not dur:
+        info = (bpms or {}).get(track_idx) or {}
+        ms = info.get("duration_ms")
+        if ms:
+            secs = ms // 1000
+            dur = f"{secs // 60}:{secs % 60:02d}"
 
-    extra = 0
-
-    # Release title wrapping (main header only).
-    if release is not None and not continuation:
-        title_raw = release.getTitle()
-        f_t = _font_for("regular", 54, title_raw)
-        title_lines = wrap_text(draw, title_raw, f_t, CW)
-        extra += (len(title_lines) - 1) * _TITLE_WRAP_LINE_H
-
-    # Track title wrapping.
-    for _side, _idx, track in tracks_with_sides:
-        if is_compilation:
-            ts = (f"{_strip_disambig(track.getArtist())} – "
-                  f"{track.getTitle(synthesise=False)}")
-        else:
-            ts = track.getTitle(synthesise=False)
-        if not isinstance(ts, str):
-            continue   # mock/stub track — skip wrapping measurement
-        f_tr = _font_for("regular", 38, ts)
-        dur = track.getDuration()
-        dur_suffix = f" ({dur})" if isinstance(dur, str) and dur else ""
-        lines = wrap_text(draw, ts + dur_suffix, f_tr, TITLE_MAX_W)
-        extra += (len(lines) - 1) * _EXTRA_LINE_H
-
-    return extra
+    return text + (f" ({dur})" if dur else "")
 
 
-def _continuous_height(tracks_with_sides, profile, continuation=False,
-                       disc_info=None, extra_px=0):
-    """Calculate canvas height for a continuous-feed label.
+# Gap + divider drawn between the track listing and the notes area.
+# Mirrors the `y += 10; hl(y); y += 18` at the top of the notes section.
+_NOTES_GAP = 28
 
-    Uses the same layout constants as render_label so the two stay in sync.
-    Raises ValueError if the result would exceed MAX_CONTINUOUS_PX (12").
+
+def _layout_height(release, tracks_with_sides, profile, is_compilation,
+                   continuation=False, disc_info=None, bpms=None):
+    """Canvas height for a continuous label, measured from a real layout pass.
+
+    This used to be predicted by a second implementation of the layout
+    (_continuous_height + _measure_wrap_extra_px) that re-derived header,
+    side-header and wrapped-line heights from constants.  Keeping two
+    implementations in agreement failed three separate times — most recently
+    when the renderer appended a Beatport duration the measurer knew nothing
+    about, wrapping two titles and printing the QR over the track listing.
+
+    Now the height comes from running render_label itself in probe mode, so
+    there is exactly one layout implementation and nothing to drift.
+
+    Raises ValueError if the result exceeds the 12" sleeve limit.
     """
-    M           = profile["margin_px"]
-    notes_lines = profile.get("notes_lines", 3)
+    content_bottom = render_label(
+        release, tracks_with_sides, profile, is_compilation,
+        continuation=continuation, disc_info=disc_info, bpms=bpms,
+        probe=True,
+    )
 
-    header_h = _HDR_H["continuation" if continuation else "normal"]
-    if disc_info:
-        header_h += _HDR_H["disc_extra"]
+    # The QR is bottom-anchored at H - M - _QR_SIZE, so the canvas must leave
+    # exactly that much below the content for it to clear the last track row.
+    height = content_bottom + _NOTES_GAP + _QR_SIZE + profile["margin_px"]
 
-    sides_seen = []
-    for entry in tracks_with_sides:
-        side = entry[0]
-        if not sides_seen or sides_seen[-1] != side:
-            sides_seen.append(side)
-    tracks_h = len(sides_seen) * _SIDE_HDR_H + len(tracks_with_sides) * _TRACK_ROW_H
-
-    # notes divider (28) + QR code (_QR_SIZE = 200) + safety buffer (_EXTRA_LINE_H = 50).
-    # The safety buffer means qr_top sits 50 px below the divider in the nominal case,
-    # absorbing up to one missed track-wrap in _measure_wrap_extra_px (a borderline
-    # title that measures differently under Arial vs LiberationSans).
-    notes_h = 28 + _QR_SIZE + _EXTRA_LINE_H
-
-    height = 2 * M + header_h + tracks_h + notes_h + extra_px
     if height > MAX_CONTINUOUS_PX:
         raise ValueError(
             f"Label would be {height/300:.2f}\" tall — exceeds the 12\" sleeve limit.\n"
@@ -399,7 +528,7 @@ def _continuous_height(tracks_with_sides, profile, continuation=False,
 
 def render_label(release, tracks_with_sides, profile,
                  is_compilation, continuation=False, disc_info=None,
-                 height_px=None, notes_lines=None, bpms=None):
+                 height_px=None, notes_lines=None, bpms=None, probe=False):
     """Render and return a single PIL Image for one label.
 
     Args:
@@ -413,11 +542,26 @@ def render_label(release, tracks_with_sides, profile,
         notes_lines:       fixed note line count; None = fill remaining space
         bpms:              {global_track_idx: bpm_int} from BeatportMatcher,
                            or None/empty to show blank write zones for all tracks
+        probe:             lay out the header and tracks but draw nothing
+                           permanent; return the y of the content bottom
+                           instead of an Image.  Used by _layout_height() so
+                           the canvas size is *measured* from a real layout
+                           rather than predicted by a parallel implementation.
+
+    Returns a PIL Image, or an int content-bottom y when probe=True.
     """
     W  = profile["width_px"]
-    H  = height_px if height_px is not None else profile["height_px"]
     M  = profile["margin_px"]
     CW = W - 2 * M   # usable content width
+
+    # Content layout never depends on H — only the bottom-anchored QR and the
+    # die-cut ruled-line fill do, and neither runs in probe mode.  So a probe
+    # can use a 1px-tall scratch canvas: Pillow clips the draw calls and the
+    # arithmetic is identical to a full render.
+    if probe:
+        H = 1
+    else:
+        H = height_px if height_px is not None else profile["height_px"]
 
     img  = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(img)
@@ -525,31 +669,17 @@ def render_label(release, tracks_with_sides, profile,
 
         pos = track["position"]
 
-        # Title: "Artist – Title" on compilations, plain title otherwise.
-        # synthesise=False keeps untitled tracks as-is rather than generating
-        # the "Release Title Position" form that dt_process uses.
-        # Strip Discogs "(N)" disambiguation suffixes from artist names.
-        if is_compilation:
-            track_str = f"{_strip_disambig(track.getArtist())} \u2013 {track.getTitle(synthesise=False)}"
-        else:
-            track_str = track.getTitle(synthesise=False)
+        # Row text, including any duration suffix.  Shared with the height
+        # calculation via _resolve_track_text so the two can never disagree
+        # about what is being laid out.
+        full_track_str = _resolve_track_text(track, track_idx,
+                                             is_compilation, bpms) or ""
 
-        # Pick a CJK-capable font if the track title requires it.
-        f_track_r = _font_for("regular", 38, track_str)
-
-        # Duration suffix — prefer Discogs duration; fall back to Beatport length_ms.
-        dur = track.getDuration()
-        if not dur:
-            _ti = bpms.get(track_idx) or {}
-            _ms = _ti.get("duration_ms")
-            if _ms:
-                _s  = _ms // 1000
-                dur = f"{_s // 60}:{_s % 60:02d}"
-        dur_suffix = f" ({dur})" if dur else ""
+        # Pick a script-capable font if the track title requires it.
+        f_track_r = _font_for("regular", 38, full_track_str)
 
         # Continuous labels: wrap to at most 2 lines (canvas grows to fit).
         # Die-cut labels: truncate only — canvas height is fixed and cannot grow.
-        full_track_str = track_str + dur_suffix
         if is_continuous:
             title_lines = wrap_text(draw, full_track_str, f_track_r, TITLE_MAX_W)
         else:
@@ -583,18 +713,34 @@ def render_label(release, tracks_with_sides, profile,
 
     # ── Notes section ─────────────────────────────────────────────────────────
 
+    # Everything above this point is the content whose height must be known
+    # before a canvas can be sized.  A probe stops here and reports it.
+    if probe:
+        return y
+
     y += 10
     hl(y); y += 18
 
     # QR code sits flush in the bottom-left corner of the notes area.
     # Ruled lines that enter the QR zone start to the right of it.
-    # qr_top is anchored to the canvas bottom so the QR is never clipped.
-    # notes_h is sized with a _EXTRA_LINE_H safety buffer so the QR never
-    # overlaps the track listing even if _measure_wrap_extra_px underestimates
-    # by one wrap (e.g. a borderline title measured differently under Arial
-    # vs LiberationSans).
+    # qr_top is anchored to the canvas bottom so the QR is never clipped;
+    # _layout_height() sized the canvas from a real layout pass so the content
+    # above is guaranteed to clear it.
     qr_top  = H - M - _QR_SIZE
     qr_left = M
+
+    # Self-check: the canvas height was predicted before rendering, so if the
+    # prediction came up short the bottom-anchored QR lands on the tracks.
+    # This has been the cause of every QR misplacement so far, and it used to
+    # fail silently — a wrong label you only notice after it prints.  Surface
+    # it instead.  `y` is the notes divider, i.e. the true content bottom.
+    if y > qr_top:
+        log.warning(
+            "label layout: content overruns the QR zone by %d px "
+            "(content bottom %d, qr_top %d) — predicted canvas height %d is "
+            "too short; the QR will overlap the track listing.",
+            y - qr_top, y, qr_top, H,
+        )
 
     def _hl_notes(line_y):
         x_left = qr_left + _QR_SIZE + 8 if line_y >= qr_top else M
@@ -626,12 +772,16 @@ def render_label(release, tracks_with_sides, profile,
     return img
 
 
-def _chunk_continuous(all_tracks, profile, is_compilation=False):
+def _chunk_continuous(all_tracks, profile, release, is_compilation=False,
+                      bpms=None):
     """Pack tracks greedily onto continuous labels up to MAX_LABEL_HEIGHT_PX.
 
     Returns a list of track-chunks.  The first chunk uses the normal (tall)
     header; subsequent chunks use the compact continuation header — so their
     heights are calculated accordingly.
+
+    `release` is required: heights come from a real layout pass, which renders
+    the header, so there is nothing to measure without it.
     """
     chunks    = []
     remaining = list(all_tracks)
@@ -641,10 +791,8 @@ def _chunk_continuous(all_tracks, profile, is_compilation=False):
 
         # Check whether all remaining tracks fit on this label.
         try:
-            _ex = _measure_wrap_extra_px(remaining, profile, is_compilation,
-                                         continuation=continuation)
-            h = _continuous_height(remaining, profile, continuation=continuation,
-                                   extra_px=_ex)
+            h = _layout_height(release, remaining, profile, is_compilation,
+                               continuation=continuation, bpms=bpms)
             fits_all = h <= MAX_LABEL_HEIGHT_PX
         except ValueError:
             fits_all = False   # exceeds 12" hard limit
@@ -658,11 +806,9 @@ def _chunk_continuous(all_tracks, profile, is_compilation=False):
         while lo < hi:
             mid = (lo + hi + 1) // 2
             try:
-                _ex = _measure_wrap_extra_px(remaining[:mid], profile,
-                                             is_compilation,
-                                             continuation=continuation)
-                h = _continuous_height(remaining[:mid], profile,
-                                       continuation=continuation, extra_px=_ex)
+                h = _layout_height(release, remaining[:mid], profile,
+                                   is_compilation, continuation=continuation,
+                                   bpms=bpms)
                 if h <= MAX_LABEL_HEIGHT_PX:
                     lo = mid
                 else:
@@ -678,14 +824,16 @@ def _chunk_continuous(all_tracks, profile, is_compilation=False):
 
 
 def _render_kwargs(tracks, profile, continuation=False, disc_info=None,
-                   release=None, is_compilation=False):
-    """Return extra kwargs for render_label based on feed type."""
+                   release=None, is_compilation=False, bpms=None):
+    """Return extra kwargs for render_label based on feed type.
+
+    `bpms` must match what is passed to render_label — duration suffixes affect
+    wrapping, and therefore the canvas height the QR is anchored to.
+    """
     if profile.get("feed") == "continuous":
-        extra = _measure_wrap_extra_px(tracks, profile, is_compilation,
-                                       release=release,
-                                       continuation=continuation)
-        h = _continuous_height(tracks, profile, continuation=continuation,
-                               disc_info=disc_info, extra_px=extra)
+        h = _layout_height(release, tracks, profile, is_compilation,
+                           continuation=continuation, disc_info=disc_info,
+                           bpms=bpms)
         return {"height_px": h, "notes_lines": profile.get("notes_lines", 3)}
     return {}
 
@@ -711,7 +859,8 @@ def render_labels_for_release(release, args, profile, bpms=None):
                     disc_tracks.append((side, idx, track))
             kw = _render_kwargs(disc_tracks, profile,
                                 disc_info=(disc_num, total_discs),
-                                release=release, is_compilation=is_compilation)
+                                release=release, is_compilation=is_compilation,
+                                bpms=bpms)
             img = render_label(release, disc_tracks, profile,
                                is_compilation,
                                disc_info=(disc_num, total_discs),
@@ -724,14 +873,17 @@ def render_labels_for_release(release, args, profile, bpms=None):
         # Die-cut labels: pack by max_tracks (fixed canvas size).
         all_tracks = flatten_discs(discs)
         if profile.get("feed") == "continuous":
-            chunks = _chunk_continuous(all_tracks, profile, is_compilation=is_compilation)
+            chunks = _chunk_continuous(all_tracks, profile, release,
+                                       is_compilation=is_compilation,
+                                       bpms=bpms)
         else:
             chunks = [all_tracks[i:i + max_tracks]
                       for i in range(0, len(all_tracks), max_tracks)]
         for idx, chunk in enumerate(chunks):
             suffix = "label" if idx == 0 else f"cont{idx}"
             kw = _render_kwargs(chunk, profile, continuation=(idx > 0),
-                               release=release, is_compilation=is_compilation)
+                                release=release, is_compilation=is_compilation,
+                                bpms=bpms)
             img = render_label(release, chunk, profile,
                                is_compilation, continuation=(idx > 0),
                                bpms=bpms, **kw)
@@ -742,14 +894,50 @@ def render_labels_for_release(release, args, profile, bpms=None):
 
 # ── Printing ──────────────────────────────────────────────────────────────────
 
-def print_label(img, printer_url, model, profile, retries=3, retry_delay=5):
-    """Send a rendered label image to the Brother printer over TCP/WiFi.
+# How long to wait for the printer to report completion after the raster data
+def _send_raster(instructions, printer_url):
+    """Write raster instructions to the printer over TCP.
+
+    There is deliberately no completion readback.  brother_ql's helpers.send()
+    declines to wait on the network backend, and while the backend does expose
+    _read(), the QL-1110NWB was probed for 10s on port 9100 and returned zero
+    bytes — it simply does not report status over the network.  Waiting only
+    added dead time to every label and stalled the queue behind it, so
+    "sent to printer" is the last observable step.
+
+    (The status-request probe lives in git history if a future printer needs
+    re-evaluating: see _send_and_await/probe_printer prior to this commit.)
+
+    Raises OSError/TimeoutError if the write fails.
+    """
+    from brother_ql.backends.network import BrotherQLBackendNetwork
+
+    printer = BrotherQLBackendNetwork(printer_url)
+    try:
+        printer.write(instructions)
+    finally:
+        try:
+            printer.dispose()
+        except Exception:
+            pass
+
+
+def print_label(img, printer_url, model, profile, retries=3, retry_delay=5,
+                progress=None):
+    """Send a rendered label image to the Brother printer over the network.
 
     Retries up to `retries` times on network errors, waiting `retry_delay`
     seconds between attempts.  Raises RuntimeError on final failure.
+
+    A retry re-sends the whole job.  If the printer has already consumed part
+    of a previous attempt it will interpret the resend's header bytes as raster
+    data and emit a garbage label, so retries are only attempted when nothing
+    was written (see `_written` below).
+
+    Nothing is returned: the printer does not report completion over the
+    network, so a successful write is as much as can be known.
     """
     from brother_ql.conversion import convert
-    from brother_ql.backends.helpers import send
     from brother_ql.raster import BrotherQLRaster
 
     qlr = BrotherQLRaster(model)
@@ -768,24 +956,34 @@ def print_label(img, printer_url, model, profile, retries=3, retry_delay=5):
 
     for attempt in range(1, retries + 1):
         try:
-            send(
-                instructions=instructions,
-                printer_identifier=printer_url,
-                backend_identifier="network",
-                blocking=True,
-            )
+            _send_raster(instructions, printer_url)
             return
         except (TimeoutError, OSError) as e:
-            if attempt < retries:
-                print(f"\n  Network error ({e}); retrying in {retry_delay}s "
-                      f"(attempt {attempt}/{retries})…", flush=True)
-                time.sleep(retry_delay)
-            else:
-                raise RuntimeError(
-                    f"Printer unreachable after {retries} attempts: {e}\n"
-                    "  Check that the printer is on, not in an error state "
-                    "(solid green LED), and reachable on the network."
-                ) from e
+            # A failure partway through sendall() may have left the printer
+            # mid-raster; resending would produce a garbage label.  Only retry
+            # when the connection never got established.
+            if isinstance(e, ConnectionError) or not _partially_written(e):
+                if attempt < retries:
+                    print(f"\n  Network error ({e}); retrying in {retry_delay}s "
+                          f"(attempt {attempt}/{retries})…", flush=True)
+                    time.sleep(retry_delay)
+                    continue
+            raise RuntimeError(
+                f"Printer send failed: {e}\n"
+                "  Check that the printer is on, not in an error state "
+                "(solid green LED), and reachable on the network.\n"
+                "  If a label printed as static, power-cycle the printer to "
+                "clear its raster buffer before retrying."
+            ) from e
+
+
+def _partially_written(exc):
+    """Heuristic: did this exception occur after some bytes reached the printer?
+
+    A connection-establishment failure is safe to retry.  A timeout during
+    sendall() is not, because the printer may be holding a half-received job.
+    """
+    return isinstance(exc, (TimeoutError, socket.timeout))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -848,27 +1046,42 @@ def _lookup_bpms(release, no_bpm=False):
     'requests' package doesn't produce a confusing traceback.
     """
     if no_bpm:
+        emit("samples", "skip")
+        emit("bpm", "skip")
         return {}
 
     try:
         import beatport
     except ImportError as e:
         log.debug("beatport module not importable: %s", e)
+        emit("samples", "skip")
+        emit("bpm", "skip")
         return {}
 
+    # beatport reports ("samples"|"bpm", done, total); forward verbatim.
+    def _bpm_progress(stage, done, total):
+        emit(stage, "progress", done=done, total=total)
+
     try:
+        emit("samples", "start")
         matcher = beatport.BeatportMatcher()
-        bpms = matcher.find_bpms(release)
+        bpms = matcher.find_bpms(release, progress=_bpm_progress)
         if bpms:
             print(f"  Beatport: matched {len(bpms)} track(s) (BPM/duration)")
         else:
             print("  Beatport: no BPMs found")
+        emit("samples", "done")
+        emit("bpm", "done", tracks=len(bpms))
         return bpms
     except beatport.BeatportError as e:
         print(f"  Beatport: skipping BPM lookup — {e}", file=sys.stderr)
+        emit("samples", "skip")
+        emit("bpm", "skip")
         return {}
     except Exception as e:
         print(f"  Beatport: unexpected error — {e}", file=sys.stderr)
+        emit("samples", "skip")
+        emit("bpm", "skip")
         return {}
 
 
@@ -878,32 +1091,49 @@ def process_release(rid, args, profile, printer_url, model):
     Returns True on success, False on error.
     """
     print(f"Fetching Discogs release {rid}\u2026")
+    emit("lookup", "start", release_id=rid)
     try:
         release = client_interface.DiscogsRelease(rid)
     except Exception as e:
         print(f"  Error fetching release {rid}: {e}", file=sys.stderr)
+        emit("lookup", "error", message=str(e))
         return False
     print(f"  {release}")
+    try:
+        emit("lookup", "done",
+             title=f"{release.getArtist()} \u2013 {release.getTitle()}")
+    except Exception:
+        emit("lookup", "done")
 
     bpms = _lookup_bpms(release, no_bpm=getattr(args, "no_bpm", False))
 
+    emit("render", "start")
     try:
         labels = render_labels_for_release(release, args, profile, bpms=bpms)
     except ValueError as e:
         print(f"  Error rendering release {rid}: {e}", file=sys.stderr)
+        emit("render", "error", message=str(e))
         return False
     if args.split and getattr(args, "discs", None):
         want = {f"disc{d}" for d in args.discs}
         all_suffixes = [s for s, _ in labels]
         labels = [(s, img) for s, img in labels if s in want]
         if not labels:
-            print(f"  No labels match --discs {args.discs}; "
-                  f"available: {all_suffixes}", file=sys.stderr)
+            msg = (f"No labels match --discs {args.discs}; "
+                   f"available: {all_suffixes}")
+            print(f"  {msg}", file=sys.stderr)
+            emit("render", "error", message=msg)
             return False
 
     print(f"  {len(labels)} label(s) to produce")
+    emit("render", "done", labels=len(labels))
 
     inter_label_delay = getattr(args, "delay", 2)
+
+    if args.preview:
+        emit("print", "skip")
+    else:
+        emit("print", "progress", done=0, total=len(labels))
 
     for i, (suffix, img) in enumerate(labels):
         if args.preview:
@@ -919,12 +1149,19 @@ def process_release(rid, args, profile, printer_url, model):
                 print_label(img, printer_url, model, profile)
             except RuntimeError as e:
                 print(f"\n  {e}", file=sys.stderr)
+                emit("print", "error", message=str(e))
                 return False
-            print("done.")
+            emit("print", "progress", done=i + 1, total=len(labels))
+            print("sent.")
+
+    if not args.preview:
+        emit("print", "done", labels=len(labels))
     return True
 
 
 def main():
+    global _progress_on
+
     parser = argparse.ArgumentParser(
         description="Print a Discogs release stat-block label for a vinyl sleeve.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -954,7 +1191,12 @@ def main():
                         help="With --split: only print these disc numbers (e.g. --discs 3)")
     parser.add_argument("--delay", metavar="SECS", type=float, default=2.0,
                         help="Seconds to wait between labels when printing multiple (default: 2)")
+    parser.add_argument("--progress", action="store_true",
+                        help="Emit machine-readable progress events on stdout "
+                             "(used by dt_server to drive the extension UI)")
     args = parser.parse_args()
+
+    _progress_on = args.progress
 
     if args.list_profiles:
         print("Available label profiles:")
@@ -968,13 +1210,10 @@ def main():
                   f"brother_ql id: {p['brother_ql_id']}")
         sys.exit(0)
 
-    # Validate: need exactly one of release_id or --file
-    if args.release_id is None and not args.file:
-        parser.error("provide a release ID or use -f/--file for batch input")
-    if args.release_id is not None and args.file:
-        parser.error("release_id and -f/--file are mutually exclusive")
-
-    # Load saved config, apply any CLI overrides, persist if changed
+    # Load saved config and apply any CLI overrides *before* validating the
+    # release arguments, so that `dt_label --printer tcp://host:9100` works as
+    # a standalone config-setting command rather than erroring out for want of
+    # a release ID it would never have used.
     config  = load_config()
     changed = False
     if args.printer:
@@ -985,6 +1224,19 @@ def main():
         config["profile"] = args.label_profile; changed = True
     if changed:
         save_config(config)
+
+    # Validate: need exactly one of release_id or --file
+    if args.release_id is None and not args.file:
+        if changed:
+            # Config-only invocation: settings saved, nothing left to print.
+            print(f"Saved to {util.userfile(CONFIG_FILE)}:")
+            for key in ("printer", "model", "profile"):
+                if key in config:
+                    print(f"  {key} = {config[key]}")
+            sys.exit(0)
+        parser.error("provide a release ID or use -f/--file for batch input")
+    if args.release_id is not None and args.file:
+        parser.error("release_id and -f/--file are mutually exclusive")
 
     printer_url  = config.get("printer")
     model        = config.get("model",   DEFAULT_MODEL)

@@ -75,11 +75,11 @@ browser.menus.onClicked.addListener(async (info) => {
   const hideBpm = stored.hide_bpm || false;
   const preview = stored.preview || false;
 
-  // Print jobs now block on the server until dt_label finishes, so both
-  // paths need a generous timeout. Preview is typically fast; real prints
-  // include a Discogs fetch, optional BPM lookup, and physical printing.
+  // Print jobs are queued server-side and return immediately, so this no
+  // longer needs a two-minute timeout. Preview still runs synchronously
+  // because the response carries the PNG URLs we need to open.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), preview ? 30_000 : 120_000);
+  const timer = setTimeout(() => controller.abort(), preview ? 30_000 : 10_000);
   try {
     const resp = await fetch(`http://localhost:${port}/print`, {
       method: "POST",
@@ -99,7 +99,9 @@ browser.menus.onClicked.addListener(async (info) => {
         browser.tabs.create({ url: `http://localhost:${port}${url}` });
       }
     } else if (!preview) {
-      notify("Label printed", `r${releaseId} sent to printer.`);
+      // Don't claim it printed — it's only queued at this point. The badge
+      // and the popup's stage list report what actually happens next.
+      pollUntilIdle();
     }
   } catch (err) {
     const msg = err.name === "AbortError"
@@ -120,3 +122,79 @@ function notify(title, message, isError = false) {
     message,
   });
 }
+
+// ── Toolbar badge ─────────────────────────────────────────────────────────────
+// Shows queue depth while work is outstanding, and a failure count afterwards.
+// Polling only runs while something is active so an idle browser stays quiet.
+
+const BADGE_POLL_MS = 1000;
+let badgeTimer = null;
+let lastFailures = 0;
+
+async function refreshBadge() {
+  const stored = await browser.storage.local.get(["port"]);
+  const port   = stored.port || DEFAULT_PORT;
+
+  let data;
+  try {
+    const resp = await fetch(`http://localhost:${port}/progress`,
+                             { signal: AbortSignal.timeout(2000) });
+    data = await resp.json();
+  } catch {
+    // Server gone: clear the badge and stop polling until the next print.
+    setBadge("", "#666");
+    stopPolling();
+    return;
+  }
+
+  if (data.depth > 0) {
+    setBadge(String(data.depth), "#d6844a");
+    return true;                       // keep polling
+  }
+
+  if (data.failures > 0) {
+    setBadge(String(data.failures), "#e06060");
+    // Notify once per new failure rather than on every poll.
+    if (data.failures > lastFailures) {
+      const failed = (data.recent || []).find(j => j.state === "error");
+      notify("Print failed", failed?.error || "A print job failed.", true);
+    }
+    lastFailures = data.failures;
+    stopPolling();
+    return false;
+  }
+
+  lastFailures = 0;
+  setBadge("", "#666");
+  stopPolling();
+  return false;
+}
+
+function setBadge(text, colour) {
+  browser.browserAction.setBadgeText({ text });
+  if (text) {
+    browser.browserAction.setBadgeBackgroundColor({ color: colour });
+  }
+}
+
+function pollUntilIdle() {
+  if (badgeTimer !== null) return;     // already polling
+  refreshBadge();
+  badgeTimer = setInterval(refreshBadge, BADGE_POLL_MS);
+}
+
+function stopPolling() {
+  if (badgeTimer !== null) {
+    clearInterval(badgeTimer);
+    badgeTimer = null;
+  }
+}
+
+// The popup posts its own print requests, so listen for those too and start
+// the badge poll on its behalf.
+browser.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === "job-queued") pollUntilIdle();
+});
+
+// Pick up anything already running when the browser starts.
+refreshBadge();

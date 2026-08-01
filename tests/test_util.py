@@ -215,3 +215,119 @@ class TestParseCollectionXml:
         ])
         result = parse_collection_xml(csv_path)
         assert result[0].collection == "Techno"
+
+
+# ─── Shared config helpers ────────────────────────────────────────────────────
+
+class TestSaveKvConfig:
+    def test_roundtrip(self, tmp_path):
+        p = str(tmp_path / "cfg")
+        util.save_kv_config(p, {"a": "1", "b": "two"})
+        assert util.load_kv_config(p) == {"a": "1", "b": "two"}
+
+    def test_header_written_as_comment(self, tmp_path):
+        p = str(tmp_path / "cfg")
+        util.save_kv_config(p, {"a": "1"}, header="hello")
+        body = open(p).read()
+        assert body.startswith("# hello\n")
+        assert util.load_kv_config(p) == {"a": "1"}   # header not parsed as data
+
+    def test_overwrites_existing(self, tmp_path):
+        p = str(tmp_path / "cfg")
+        util.save_kv_config(p, {"a": "1", "b": "2"})
+        util.save_kv_config(p, {"a": "9"})
+        assert util.load_kv_config(p) == {"a": "9"}
+
+    def test_values_with_equals_survive_roundtrip(self, tmp_path):
+        p = str(tmp_path / "cfg")
+        util.save_kv_config(p, {"url": "http://h:8000/v1?k=v"})
+        assert util.load_kv_config(p)["url"] == "http://h:8000/v1?k=v"
+
+
+class TestResolveAnthropicKey:
+    """Precedence: beatport_auth.json, then ANTHROPIC_API_KEY.
+
+    This lookup previously existed in four places (dt_server twice, dt_find,
+    beatport). These tests pin the order so the shared helper cannot drift.
+    """
+
+    def _auth(self, tmp_path, payload):
+        d = tmp_path / ".discogstool"
+        d.mkdir(exist_ok=True)
+        (d / "beatport_auth.json").write_text(payload)
+        return str(tmp_path)
+
+    def test_reads_key_from_auth_file(self, tmp_path, monkeypatch):
+        home = self._auth(tmp_path, '{"anthropic_api_key": "sk-from-file"}')
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert util.resolve_anthropic_key() == "sk-from-file"
+
+    def test_auth_file_wins_over_env(self, tmp_path, monkeypatch):
+        home = self._auth(tmp_path, '{"anthropic_api_key": "sk-from-file"}')
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+        assert util.resolve_anthropic_key() == "sk-from-file"
+
+    def test_falls_back_to_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+        assert util.resolve_anthropic_key() == "sk-from-env"
+
+    def test_empty_key_in_file_falls_through_to_env(self, tmp_path, monkeypatch):
+        home = self._auth(tmp_path, '{"anthropic_api_key": ""}')
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+        assert util.resolve_anthropic_key() == "sk-from-env"
+
+    def test_malformed_json_falls_through_to_env(self, tmp_path, monkeypatch):
+        home = self._auth(tmp_path, "{not json")
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+        assert util.resolve_anthropic_key() == "sk-from-env"
+
+    def test_none_when_nothing_configured(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert util.resolve_anthropic_key() is None
+
+
+class TestDataDirIsLazy:
+    """Importing util must not touch the filesystem.
+
+    datapath used to be a module constant computed at import, which both
+    created ~/.discogstool as an import side effect and froze HOME before any
+    test could redirect it.
+    """
+
+    def test_userfile_follows_home_at_call_time(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert util.userfile("x").startswith(str(tmp_path))
+
+    def test_datadir_creates_on_demand(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        target = tmp_path / ".discogstool"
+        assert not target.exists()
+        util.userfile("anything")
+        assert target.exists()
+
+    def test_datadir_can_skip_creation(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        util.datadir(create=False)
+        assert not (tmp_path / ".discogstool").exists()
+
+    def test_legacy_datapath_attribute_still_works(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert util.datapath == str(tmp_path / ".discogstool")
+
+    def test_unknown_attribute_still_raises(self):
+        with pytest.raises(AttributeError):
+            util.no_such_attribute
+
+    def test_import_alone_creates_nothing(self, tmp_path):
+        """A fresh interpreter importing util must not create the directory."""
+        import subprocess, sys as _sys, os as _os
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        env = dict(_os.environ, HOME=str(tmp_path), PYTHONPATH=root)
+        subprocess.run([_sys.executable, "-c", "import util"], env=env, check=True)
+        assert not (tmp_path / ".discogstool").exists()

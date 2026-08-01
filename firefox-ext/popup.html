@@ -122,6 +122,87 @@
     #status.ok    { color: #6dbf67; }
     #status.error { color: #e06060; }
 
+    /* ── Job progress ─────────────────────────────────────────────────── */
+
+    #progress {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid #2a2a2a;
+    }
+
+    #progress.hidden { display: none; }
+
+    #job-header {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    #job-title {
+      font-size: 11px;
+      color: #ccc;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #queue-count {
+      font-size: 10px;
+      color: #888;
+      background: #2a2a2a;
+      border-radius: 8px;
+      padding: 1px 6px;
+      white-space: nowrap;
+    }
+
+    #queue-count.hidden { display: none; }
+
+    ul#stages {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    ul#stages li {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #555;
+      line-height: 1.6;
+    }
+
+    .stage-mark {
+      width: 12px;
+      text-align: center;
+      flex: 0 0 12px;
+      font-size: 10px;
+    }
+
+    .stage-name  { flex: 1; }
+    .stage-count { color: #777; font-variant-numeric: tabular-nums; }
+
+    li.pending  { color: #555; }
+    li.active   { color: #e0e0e0; }
+    li.active .stage-mark { color: #d6844a; }
+    li.done     { color: #8a8a8a; }
+    li.done .stage-mark   { color: #6dbf67; }
+    li.skip     { color: #4a4a4a; }
+    li.error    { color: #e06060; }
+    li.warn .stage-mark   { color: #d6a44a; }
+
+    #job-error {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #e06060;
+      word-break: break-word;
+    }
+
+    #job-error.hidden { display: none; }
+
     footer {
       padding: 8px 12px 10px;
       border-top: 1px solid #2a2a2a;
@@ -201,6 +282,41 @@
     <button id="print-btn" disabled>Print Label</button>
 
     <div id="status"></div>
+
+    <div id="progress" class="hidden">
+      <div id="job-header">
+        <span id="job-title">—</span>
+        <span id="queue-count" class="hidden"></span>
+      </div>
+      <ul id="stages">
+        <li data-stage="lookup"  class="pending">
+          <span class="stage-mark">○</span>
+          <span class="stage-name">Release lookup</span>
+          <span class="stage-count"></span>
+        </li>
+        <li data-stage="samples" class="pending">
+          <span class="stage-mark">○</span>
+          <span class="stage-name">Sample download</span>
+          <span class="stage-count"></span>
+        </li>
+        <li data-stage="bpm"     class="pending">
+          <span class="stage-mark">○</span>
+          <span class="stage-name">BPM calculation</span>
+          <span class="stage-count"></span>
+        </li>
+        <li data-stage="render"  class="pending">
+          <span class="stage-mark">○</span>
+          <span class="stage-name">Render label</span>
+          <span class="stage-count"></span>
+        </li>
+        <li data-stage="print"   class="pending">
+          <span class="stage-mark">○</span>
+          <span class="stage-name">Sent to printer</span>
+          <span class="stage-count"></span>
+        </li>
+      </ul>
+      <div id="job-error" class="hidden"></div>
+    </div>
   </main>
 
   <footer>

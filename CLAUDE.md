@@ -49,6 +49,35 @@ All entry-point scripts have no `.py` extension. Tests load them via `importlib.
 
 The extension popup calls `http://localhost:5679/status` (health) and `POST /print` (release_id, profile, preview, split, discs). The server delegates to `dt_label` as a subprocess, serves preview PNGs from a temp dir, and reports Discogs/Beatport/Anthropic/LLM credential status in the `/status` response. The popup footer displays four connection dots: Discogs, Beatport, Anthropic (used by the Beatport matcher), and Finder (the dt_find LLM backend, labelled "Claude" or "Local LLM" depending on the configured backend).
 
+### Job queue and progress reporting
+
+`POST /print` **enqueues** and returns immediately with `{job_id, queued}`; a single worker thread drains the queue so jobs never race at the printer. Preview stays synchronous because its response carries the PNG URLs.
+
+Because printing is async, errors no longer ride back on the `/print` response — they live on the job record. A failed job does **not** halt the queue; it is retained with its error so the UI can show it.
+
+**The popup's status line is derived from `/progress`, never captured from the `POST /print` response.** Writing it at POST time produced a line frozen on "Queued." while the label was already printing. `describeJob()` in popup.js is the single place that decides the text; `holdStatus` is the only override, reserved for terminal messages (preview opened, request failed) that must outlive job state. A finished job clears from the panel after `RECENT_GRACE_S`, so reopening the popup later doesn't look like work is still in flight.
+
+`tests/js/popup_harness.js` stubs `document`/`browser`, evaluates the real popup.js, and asserts the status text across job states; `tests/test_popup_js.py` runs it under pytest (skipped without node).
+
+`GET /progress` returns the running job, queued jobs, `depth`, and `failures`. `POST /jobs/clear` drops finished/failed history. The popup polls `/progress` every 500 ms while open; `background.js` polls once per second only while work is outstanding, driving the toolbar badge (queue depth in orange, failure count in red).
+
+**Progress protocol.** `dt_label --progress` writes JSON lines to stdout prefixed with `@@DTP@@ `; `_run_dt_label` streams these via `Popen` and folds them into the job with `_apply_event`. Non-progress output is accumulated and used as the error message if the process exits non-zero. Keeping events on stdout (rather than a side channel) means `dt_label --progress` is directly debuggable from a terminal.
+
+Stages, in display order: `lookup`, `samples`, `bpm`, `render`, `print`. Event states are `start`, `progress` (with `done`/`total`), `done`, `skip`, and `error`. `dt_label.STAGES` and `dt_server.STAGES` must stay in sync.
+
+The `samples` and `bpm` stages come from a callback threaded through `BeatportMatcher.find_bpms(progress=…)` into `_verify_bpms`, which counts only tracks that actually need work — a fully cached release reports nothing and skips the (slow) essentia import entirely.
+
+### Printing
+
+`_send_raster()` opens a TCP connection, writes the raster, and returns. There is **no completion readback**: brother_ql's `helpers.send()` declines to wait on the network backend, and although the backend does expose `_read()`, the QL-1110NWB was probed for 10 s on port 9100 and returned zero bytes. It does not report status over the network. "Sent to printer" is therefore the last observable step, and the stage list ends there.
+
+An earlier revision implemented full status-packet readback (`_send_and_await`, `_status_frames`, `probe_printer`, `--probe-printer`). It is in git history if a future printer needs re-evaluating. Two traps it documented are worth remembering before reviving it:
+
+- `interpret_response` raises **`NameError`** — not `ValueError` — for a short buffer or bad header. brother_ql's own handler catches `ValueError`, so it is dead code; an uncaught `NameError` killed the print job *after* the label had printed.
+- Status packets are exactly 32 bytes, but TCP may split one across reads or coalesce several. Framing must buffer rather than assume one `recv()` is one packet.
+
+**Retry safety.** A `sendall()` timeout may leave the printer holding a half-received job; resending would make it consume the new job's header bytes as raster data and emit a garbage label. `print_label` therefore only retries when the failure was connection-establishment, not a mid-transfer timeout (see `_partially_written`).
+
 ### dt_process pipeline
 
 File patterns:
@@ -133,6 +162,15 @@ Catno normalisation strips: Unicode combining marks, zero-width spaces (Cf categ
 
 ---
 
+
+### Test conventions worth keeping
+
+**Assert on output, not absence of exceptions.** The label tests render to a canvas and check pixels (`_ink()` counts non-white pixels; `_bpm_zone()`/`_qr_zone()` crop the regions of interest). Two tests previously called `render_label` and asserted nothing — they were named as if they verified BPM and artist rendering but would have passed with that drawing removed entirely. That blind spot is why a QR printing over the track listing survived three fixes.
+
+**libtags tests use real files, not mocked mutagen.** `mutagen.File()` tags a generated WAV with genuine ID3 frames (`_WaveID3` subclasses `ID3`), so `AudioFile` round-trips are tested against the real library. `rename_file(dryrun=True)` returns the computed destination without touching the filesystem, making the naming logic directly testable.
+
+**Characterization before refactor.** `tests/test_config_parsing.py` was written by *running* the pre-refactor parser against edge cases and recording what it did, then asserting every caller still matches. Prefer that to reading the code and writing what it looks like it should do.
+
 ## Running Tests
 
 ```bash
@@ -148,6 +186,17 @@ All external APIs (Discogs, Beatport, Anthropic, ffmpeg, printer) are mocked. Te
 ---
 
 ## Development
+
+### Setting dt_label config
+
+`--printer`, `--model`, and `--label-profile` persist to `~/.discogstool/label_config` and can be used without a release ID, which saves and exits:
+
+```bash
+./dt_label --printer tcp://brn94ddf8a9c192.local:9100
+./dt_label --model QL-1110NWB --label-profile dk22243
+```
+
+Config is loaded and saved *before* the release-argument validation runs, so a config-only invocation isn't rejected for lacking a release ID. Keys merge — setting one leaves the others intact.
 
 ### Running dt_server manually
 ```bash
@@ -207,6 +256,14 @@ python3 beatport.py --clear-match 12345678      # remove cached result
 
 ## Key Code Conventions
 
+**One tool dispatcher in `dt_find`**: `_dispatch_tool()` executes a tool call for both backends. The OpenAI and Anthropic wire formats differ, but the decision and side effects are identical, and each backend used to carry its own copy of them.
+
+**Shared helpers in `util.py`**: `load_kv_config`/`save_kv_config` own the `key=value` dotfile format used by `label_config` and `find_config` — dt_label, dt_find and dt_server previously each carried a byte-identical copy of the parser. Its quirks (last duplicate key wins, `#` only starts a comment at line start, split on first `=` only) are load-bearing for existing files and pinned by `tests/test_config_parsing.py`, which asserts every caller produces identical output. `resolve_anthropic_key()` is the single Anthropic key lookup (auth file, then `ANTHROPIC_API_KEY`); it replaced four copies.
+
+**Module paths are resolved per call, not at import**: `util.datadir()` and `beatport.auth_file()`/`cache_file()`/`log_file()` are functions. `beatport.CACHE_FILE` was also a default argument (`db_path: str = CACHE_FILE`), which evaluates at import no matter how lazy the constant is. Historical attribute names still resolve via module `__getattr__`.
+
+**`util.datadir()` is lazy**: `~/.discogstool` is resolved and created per call, not at import. It used to be a module constant, so importing `util` created a directory as a side effect and froze `$HOME` before any test could redirect it — patching `HOME` in a test had no effect and writes escaped to the real home directory. `util.datapath` still works via a module `__getattr__`. When testing config code, patch `util.userfile` or set `HOME`; both now work.
+
 **Type annotations**: `from __future__ import annotations` everywhere. TypedDict used for all API response shapes. Not all modules are fully annotated.
 
 **Error handling**: Custom exceptions (`ClientException`, `TagsException`, `ConversionException`, `BeatportError`). Network calls retry with backoff. Subprocess failures checked via `returncode`. Beatport failures degrade gracefully (label prints without BPM).
@@ -230,13 +287,62 @@ python3 beatport.py --clear-match 12345678      # remove cached result
 
 Continuous labels use binary search to pack tracks into ≤11.5" chunks (≤3600 px height).
 
+### QR placement — height is measured, not predicted
+
+The QR is anchored to the canvas bottom (`qr_top = H - M - _QR_SIZE`), so it lands correctly only if `H` accounts for everything above it.
+
+`H` used to be *predicted* by a second implementation of the layout (`_continuous_height` + `_measure_wrap_extra_px`) that re-derived header, side-header and wrapped-line heights from constants. Keeping two implementations in agreement failed three separate times, always the same way: they disagreed about **what text gets laid out**, a longer string wrapped to a second line, the canvas came up short, and the QR printed over the tracks. The last instance was the Beatport `duration_ms` fallback — the renderer appended a duration the measurer knew nothing about, wrapping two titles on r4884361, 100 px short.
+
+There is now one implementation. `render_label(..., probe=True)` runs the real header/track layout and returns the content-bottom `y` instead of an image; `_layout_height()` adds `_NOTES_GAP + _QR_SIZE + margin` to it. Clearance is therefore exactly `_NOTES_GAP` by construction, and the old safety buffer is gone (labels are ~50 px shorter).
+
+Two invariants make the probe valid, both pinned by tests:
+
+- Content layout never reads `H` — only the bottom-anchored QR and the die-cut ruled-line fill do, and neither runs in probe mode. That is why a probe can use a 1 px scratch canvas: Pillow clips the draws and the arithmetic is unchanged.
+- `_resolve_track_text()` is the single source of truth for a row's text. Anything affecting row content belongs in there, so probe and render can't diverge.
+
+`render_label()` still warns via `log.warning` if content crosses `qr_top`. That should now be unreachable; it is a tripwire, not a safety net.
+
+### Font fallback
+
+Labels default to Arial (macOS) / Liberation Sans (Linux), neither of which covers
+non-Latin scripts. `_font_for(style, size, text)` therefore checks *actual glyph
+coverage* rather than guessing from Unicode ranges: `_covers()` rasterises a
+character and compares it against the face's `.notdef` box, probed with U+FFFE (a
+permanent noncharacter no font may map). Coverage is size-independent, so it is
+probed once at `_PROBE_SIZE` and cached per `(font path, char)`.
+
+If the primary face is missing glyphs, `_FALLBACK_ORDER` (`cjk`, `devanagari`,
+`thai`, `arabic`, `hebrew`, `unicode`) is walked and the first face covering the
+**entire** string wins. Whole-string coverage matters because Pillow renders a run
+in a single face — a fallback that fixes the Devanagari but drops the Latin is no
+improvement. If nothing covers everything, the best face is used and a one-time
+warning listing the offending codepoints goes to stderr.
+
+Consequence: a track row containing non-Latin text renders entirely in the
+fallback face, so that row's Latin text will not match Arial elsewhere on the label.
+
+**Complex scripts need shaping, not just glyphs.** Devanagari reorders matras
+(`ि` is stored after its consonant but renders before it) and forms conjuncts;
+Arabic needs contextual joining. Pillow only does this when built with
+Raqm/HarfBuzz, which it selects automatically when available. Verify with:
+
+```bash
+.venv/bin/python3 -c "from PIL import features; print(features.check('raqm'))"
+```
+
+If this is False, non-Latin titles render with correct glyphs in the wrong order —
+subtly wrong rather than obviously broken.
+
 ---
 
 ## Notable Quirks
 
 - **macOS-only features**: `install_server.sh` (launchd), `dt_find` speech recognition, Arial font paths. The rest works on Linux.
+- **Font fallback is best-effort**: it can only pick from faces installed on the machine. A script with no installed font prints boxes plus a stderr warning rather than failing the job. Bold/condensed styles are not preserved when falling back — script fallback faces are regular weight only.
 - **Beatport client ID**: scraped from a docs page JS bundle via regex. If Beatport updates their page structure this will break; run `python3 beatport.py --setup` to force a re-auth which will re-scrape it.
 - **WAV regions**: Reaper writes track boundaries into the WAV `smpl` chunk as loop points. If region count doesn't match the Discogs tracklist, `dt_process` falls back to consecutive cue positions with a dynamic minimum-duration heuristic.
 - **ID3 version**: writes ID3v2.3 (encoding=3, UTF-8), not v2.4.
 - **Discogs consumer keys**: the OAuth consumer key/secret are hardcoded public demo credentials. They are not secret.
+- **dt_server's worker thread starts in `main()`, not at import**: importing dt_server (as the test suite does) must not spawn a thread that races the caller for queued jobs or launches real dt_label subprocesses. Tests call `_execute_job` directly.
+- **Flask sorts JSON keys**, so `/progress` returns `stages` alphabetically rather than in pipeline order. The popup renders in DOM order and ignores this; the canonical order is also returned as a `stages` array.
 - **AnthropicMatcher validation**: the model's returned Beatport ID is validated against the candidate list presented in the prompt. IDs not in the list are silently discarded to prevent hallucination.

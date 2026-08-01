@@ -1,16 +1,96 @@
 from __future__ import annotations
 
 import os
+import json
 import csv
 
-datapath = os.path.expanduser(os.path.join("~", ".discogstool"))
+DATA_DIRNAME = ".discogstool"
 
-if not os.path.exists(datapath):
-    os.mkdir(datapath)
+
+def datadir(create: bool = True) -> str:
+    """Return ~/.discogstool, creating it on first use.
+
+    Resolved per call rather than at import.  The path used to be a module
+    constant computed at import time, which meant importing util created a
+    directory as a side effect, and tests could not redirect it by setting
+    HOME — the value was already baked in before the test ran.
+    """
+    path = os.path.expanduser(os.path.join("~", DATA_DIRNAME))
+    if create and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def __getattr__(name: str):
+    """Lazily provide the historical `util.datapath` attribute.
+
+    PEP 562 module __getattr__ — keeps `util.datapath` working for any caller
+    while removing the import-time filesystem side effect.
+    """
+    if name == "datapath":
+        return datadir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def userfile(fname: str) -> str:
-    return os.path.join(datapath, fname)
+    return os.path.join(datadir(), fname)
+
+
+# ── key=value config files ────────────────────────────────────────────────────
+# dt_label, dt_find and dt_server each had their own byte-identical copy of
+# this parser.  The quirks below are load-bearing for existing config files and
+# are pinned by tests/test_config_parsing.py.
+
+def load_kv_config(path: str) -> dict[str, str]:
+    """Read a `key=value` config file into a dict.
+
+    Behaviour, unchanged from the three implementations this replaces:
+      * missing file yields {}
+      * blank lines, and lines whose first non-space character is '#', are skipped
+      * lines without '=' are skipped
+      * split on the *first* '=' only, so values may contain '='
+      * key and value are stripped of surrounding whitespace
+      * a '#' anywhere after the '=' is part of the value, not a comment
+      * duplicate keys: the last occurrence wins
+    """
+    config: dict[str, str] = {}
+    if not os.path.exists(path):
+        return config
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                config[k.strip()] = v.strip()
+    return config
+
+
+def save_kv_config(path: str, config: dict, header: str | None = None) -> None:
+    """Write a `key=value` config file, optionally with a leading comment."""
+    with open(path, "w") as f:
+        if header:
+            f.write(f"# {header}\n")
+        for k, v in config.items():
+            f.write(f"{k}={v}\n")
+
+
+def resolve_anthropic_key() -> str | None:
+    """Return the Anthropic API key, or None if not configured.
+
+    Checked in order: `anthropic_api_key` in ~/.discogstool/beatport_auth.json,
+    then the ANTHROPIC_API_KEY environment variable.  This lookup previously
+    existed in four places (dt_server twice, dt_find, beatport).
+    """
+    auth_file = userfile("beatport_auth.json")
+    if os.path.exists(auth_file):
+        try:
+            with open(auth_file) as f:
+                key = json.load(f).get("anthropic_api_key")
+            if key:
+                return key
+        except (OSError, ValueError):
+            pass   # unreadable or malformed — fall through to the env var
+    return os.environ.get("ANTHROPIC_API_KEY") or None
 
 
 def file_extension(path: str) -> str:

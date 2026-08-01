@@ -35,6 +35,33 @@ sys.modules["dt_server"] = dt_server
 _loader.exec_module(dt_server)
 
 _split_args = dt_server._split_args
+
+
+def _drain_one():
+    """Pop the next queued job off the queue.
+
+    Safe because dt_server only starts its worker thread from main(), so
+    nothing competes with the test for queue items.
+    """
+    return dt_server._job_queue.get_nowait()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_jobs():
+    """Reset queue and job registry so tests don't leak state into each other."""
+    while True:
+        try:
+            dt_server._job_queue.get_nowait()
+        except Exception:
+            break
+    dt_server._jobs.clear()
+    yield
+    while True:
+        try:
+            dt_server._job_queue.get_nowait()
+        except Exception:
+            break
+    dt_server._jobs.clear()
 _bpm_args   = dt_server._bpm_args
 app         = dt_server.app
 
@@ -157,75 +184,96 @@ class TestPrintEndpoint:
         assert data["ok"] is False
         assert "message" in data
 
-    def test_valid_release_id_runs_dt_label(self, client):
-        """A valid release ID should invoke dt_label synchronously and return ok."""
-        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
-            response = client.post("/print",
-                                   data=json.dumps({"release_id": "12345"}),
-                                   content_type="application/json")
-        mock_run.assert_called_once()
+    def test_valid_release_id_is_queued(self, client):
+        """A valid release ID is accepted and queued, not run inline."""
+        response = client.post("/print",
+                               data=json.dumps({"release_id": "12345"}),
+                               content_type="application/json")
         assert response.status_code == 200
+        data = json.loads(response.data)
+        assert data["ok"] is True
+        assert "job_id" in data
 
     def test_successful_print_returns_ok(self, client):
-        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")):
-            response = client.post("/print",
-                                   data=json.dumps({"release_id": "12345"}),
-                                   content_type="application/json")
+        response = client.post("/print",
+                               data=json.dumps({"release_id": "12345"}),
+                               content_type="application/json")
         data = json.loads(response.data)
         assert data["ok"] is True
 
-    def test_dt_label_failure_returns_500(self, client):
-        with patch.object(dt_server, "_run_dt_label", return_value=(1, "error output")):
-            with dt_server.app.app_context():
-                resp, status = dt_server._run_print("12345", "dk1247")
-        assert status == 500
-        data = json.loads(resp.data)
-        assert data["ok"] is False
+    def test_queue_depth_reported(self, client):
+        first = json.loads(client.post(
+            "/print", data=json.dumps({"release_id": "111"}),
+            content_type="application/json").data)
+        second = json.loads(client.post(
+            "/print", data=json.dumps({"release_id": "222"}),
+            content_type="application/json").data)
+        assert second["queued"] >= first["queued"]
+
+    def test_failure_recorded_on_job(self, client):
+        """dt_label failing marks the job errored and keeps the message."""
+        job = dt_server._new_job("12345", "print")
+        job["args"] = ["--", "12345"]
+        with patch.object(dt_server, "_run_dt_label",
+                          return_value=(1, "boom")):
+            dt_server._execute_job(job)
+        assert job["state"] == "error"
+        assert "boom" in job["error"]
+
+    def test_failure_does_not_stop_later_jobs(self, client):
+        """A failed job must not prevent the next one from running."""
+        bad = dt_server._new_job("111", "print"); bad["args"] = ["--", "111"]
+        good = dt_server._new_job("222", "print"); good["args"] = ["--", "222"]
+        with patch.object(dt_server, "_run_dt_label", return_value=(1, "boom")):
+            dt_server._execute_job(bad)
+        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")):
+            dt_server._execute_job(good)
+        assert bad["state"] == "error"
+        assert good["state"] == "done"
 
     def test_profile_passed_to_dt_label(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             with dt_server.app.app_context():
-                dt_server._run_print("12345", "dk22243")
-        args_used = mock_run.call_args[0][0]
-        assert "dk22243" in args_used
+                dt_server._queue_print("12345", "dk22243")
+            job = _drain_one()
+            dt_server._execute_job(job)
+        assert "dk22243" in mock_run.call_args[0][0]
 
     def test_split_flag_passed(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             with dt_server.app.app_context():
-                dt_server._run_print("12345", "dk1247", split=True)
-        args_used = mock_run.call_args[0][0]
-        assert "--split" in args_used
+                dt_server._queue_print("12345", "dk1247", split=True)
+            dt_server._execute_job(_drain_one())
+        assert "--split" in mock_run.call_args[0][0]
 
     def test_no_bpm_flag_not_present_by_default(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             with dt_server.app.app_context():
-                dt_server._run_print("12345", "dk1247")
-        args_used = mock_run.call_args[0][0]
-        assert "--no-bpm" not in args_used
+                dt_server._queue_print("12345", "dk1247")
+            dt_server._execute_job(_drain_one())
+        assert "--no-bpm" not in mock_run.call_args[0][0]
 
     def test_no_bpm_flag_passed_when_requested(self, client):
         with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
             with dt_server.app.app_context():
-                dt_server._run_print("12345", "dk1247", no_bpm=True)
-        args_used = mock_run.call_args[0][0]
-        assert "--no-bpm" in args_used
+                dt_server._queue_print("12345", "dk1247", no_bpm=True)
+            dt_server._execute_job(_drain_one())
+        assert "--no-bpm" in mock_run.call_args[0][0]
 
     def test_hide_bpm_passed_to_dt_label(self, client):
-        """hide_bpm=true in the POST payload should add --no-bpm to the dt_label call."""
-        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
-            client.post("/print",
-                        data=json.dumps({"release_id": "12345", "hide_bpm": True}),
-                        content_type="application/json")
-        args_used = mock_run.call_args[0][0]
-        assert "--no-bpm" in args_used
+        """hide_bpm=true in the POST payload should add --no-bpm to the job args."""
+        client.post("/print",
+                    data=json.dumps({"release_id": "12345", "hide_bpm": True}),
+                    content_type="application/json")
+        job = _drain_one()
+        assert "--no-bpm" in job["args"]
 
     def test_hide_bpm_false_by_default(self, client):
-        with patch.object(dt_server, "_run_dt_label", return_value=(0, "")) as mock_run:
-            client.post("/print",
-                        data=json.dumps({"release_id": "12345"}),
-                        content_type="application/json")
-        args_used = mock_run.call_args[0][0]
-        assert "--no-bpm" not in args_used
+        client.post("/print",
+                    data=json.dumps({"release_id": "12345"}),
+                    content_type="application/json")
+        job = _drain_one()
+        assert "--no-bpm" not in job["args"]
 
 
 # ─── /print preview mode ──────────────────────────────────────────────────────
@@ -234,7 +282,7 @@ class TestPreviewMode:
     def test_preview_mode_calls_dt_label_with_preview_flag(self, client, tmp_path):
         # _run_dt_label is mocked to create a fake PNG in PREVIEW_DIR
         # (the function first clears PREVIEW_DIR, then calls dt_label, then globs)
-        def fake_run(args, *, capture=False):
+        def fake_run(args, *, job=None):
             import pathlib
             (pathlib.Path(dt_server.PREVIEW_DIR) / "12345_label.png").write_bytes(b"fake")
             return (0, "")
@@ -252,7 +300,7 @@ class TestPreviewMode:
 
     def test_preview_no_bpm_flag_passed(self, client, tmp_path):
         """hide_bpm=true in a preview request should pass --no-bpm to dt_label."""
-        def fake_run(args, *, capture=False):
+        def fake_run(args, *, job=None):
             import pathlib
             (pathlib.Path(dt_server.PREVIEW_DIR) / "label.png").write_bytes(b"fake")
             return (0, "")
@@ -276,3 +324,78 @@ class TestPreviewMode:
                                    content_type="application/json")
 
         assert response.status_code == 500
+
+
+# ─── Progress events and job state ────────────────────────────────────────────
+
+class TestProgressEvents:
+    def test_apply_event_sets_stage_state(self):
+        job = dt_server._new_job("1", "print")
+        dt_server._apply_event(job, {"stage": "lookup", "state": "done",
+                                     "title": "Various – Playbook001"})
+        assert job["stages"]["lookup"]["state"] == "done"
+        assert job["title"] == "Various – Playbook001"
+
+    def test_apply_event_carries_counts(self):
+        job = dt_server._new_job("1", "print")
+        dt_server._apply_event(job, {"stage": "bpm", "state": "progress",
+                                     "done": 2, "total": 4})
+        assert job["stages"]["bpm"]["done"] == 2
+        assert job["stages"]["bpm"]["total"] == 4
+
+    def test_apply_event_records_error(self):
+        job = dt_server._new_job("1", "print")
+        dt_server._apply_event(job, {"stage": "render", "state": "error",
+                                     "message": "too tall"})
+        assert job["error"] == "too tall"
+
+    def test_unknown_stage_ignored(self):
+        job = dt_server._new_job("1", "print")
+        dt_server._apply_event(job, {"stage": "bogus", "state": "done"})
+        assert "bogus" not in job["stages"]
+
+    def test_all_stages_start_pending(self):
+        job = dt_server._new_job("1", "print")
+        assert all(s["state"] == "pending" for s in job["stages"].values())
+        assert list(job["stages"]) == list(dt_server.STAGES)
+
+
+class TestProgressEndpoint:
+    def test_progress_reports_depth(self, client):
+        client.post("/print", data=json.dumps({"release_id": "12345"}),
+                    content_type="application/json")
+        data = json.loads(client.get("/progress").data)
+        assert data["ok"] is True
+        assert data["depth"] == 1
+
+    def test_progress_lists_queued_job(self, client):
+        client.post("/print", data=json.dumps({"release_id": "999"}),
+                    content_type="application/json")
+        data = json.loads(client.get("/progress").data)
+        assert data["queued"][0]["release_id"] == "999"
+
+    def test_progress_hides_internal_args(self, client):
+        client.post("/print", data=json.dumps({"release_id": "999"}),
+                    content_type="application/json")
+        data = json.loads(client.get("/progress").data)
+        assert "args" not in data["queued"][0]
+
+    def test_progress_counts_failures(self, client):
+        job = dt_server._new_job("1", "print")
+        job["args"] = ["--", "1"]
+        with patch.object(dt_server, "_run_dt_label", return_value=(1, "boom")):
+            dt_server._execute_job(job)
+        data = json.loads(client.get("/progress").data)
+        assert data["failures"] == 1
+
+    def test_clear_jobs_drops_finished(self, client):
+        job = dt_server._new_job("1", "print")
+        job["args"] = ["--", "1"]
+        with patch.object(dt_server, "_run_dt_label", return_value=(1, "boom")):
+            dt_server._execute_job(job)
+        client.post("/jobs/clear")
+        data = json.loads(client.get("/progress").data)
+        assert data["failures"] == 0
+
+    def test_progress_options_preflight(self, client):
+        assert client.options("/progress").status_code == 204

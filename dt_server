@@ -12,12 +12,17 @@ Default port: 5679 (configurable; must match the extension setting).
 
 import sys
 import os
+import json
+import time
 import atexit
 import shutil
 import argparse
 import tempfile
 import subprocess
+import itertools
+import collections
 import glob
+import queue
 import threading
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -35,11 +40,116 @@ app = Flask(__name__)
 PREVIEW_DIR = tempfile.mkdtemp(prefix="dt_label_previews_")
 atexit.register(shutil.rmtree, PREVIEW_DIR, ignore_errors=True)
 
-# ── Print serialisation lock ──────────────────────────────────────────────────
-# Ensures only one dt_label subprocess runs at a time so concurrent extension
-# requests cannot race each other at the printer.
+# ── Job queue and progress state ──────────────────────────────────────────────
+# Print jobs run one at a time on a worker thread so concurrent extension
+# requests cannot race each other at the printer.  POST /print returns as soon
+# as the job is queued; the extension polls GET /progress to follow it.
+#
+# This is deliberately async: queue depth cannot exist otherwise.  Errors that
+# used to ride back on the /print response now live on the job record, which is
+# retained after failure so the UI can show what went wrong.
 
-_print_lock = threading.Lock()
+_PROGRESS_PREFIX = "@@DTP@@ "
+
+# Stages in display order.  Keep in sync with dt_label.STAGES.
+STAGES = ("lookup", "samples", "bpm", "render", "print")
+
+# How many finished jobs to keep for display before discarding.
+_HISTORY_LIMIT = 20
+
+_job_queue   = queue.Queue()
+_jobs        = collections.OrderedDict()   # job_id -> job dict
+_jobs_lock   = threading.Lock()
+_job_counter = itertools.count(1)
+
+
+def _new_job(release_id, kind, **extra):
+    """Create and register a job record."""
+    job = {
+        "id":         next(_job_counter),
+        "release_id": release_id,
+        "kind":       kind,             # "print" | "preview"
+        "state":      "queued",         # queued | running | done | error
+        "stages":     {s: {"state": "pending"} for s in STAGES},
+        "title":      None,
+        "error":      None,
+        "created":    time.time(),
+    }
+    job.update(extra)
+    with _jobs_lock:
+        _jobs[job["id"]] = job
+        # Trim the oldest finished jobs, keeping anything queued or running.
+        finished = [j for j in _jobs.values() if j["state"] in ("done", "error")]
+        for old in finished[:max(0, len(finished) - _HISTORY_LIMIT)]:
+            _jobs.pop(old["id"], None)
+    return job
+
+
+def _apply_event(job, event):
+    """Fold one dt_label progress event into a job record."""
+    stage = event.get("stage")
+    if stage not in job["stages"]:
+        return
+    entry = {"state": event.get("state", "pending")}
+    for key in ("done", "total", "labels", "tracks", "message"):
+        if key in event:
+            entry[key] = event[key]
+    job["stages"][stage] = entry
+    if stage == "lookup" and event.get("title"):
+        job["title"] = event["title"]
+    if event.get("state") == "error":
+        job["error"] = event.get("message") or "failed"
+
+
+def _print_worker():
+    """Drain _job_queue one job at a time."""
+    while True:
+        job = _job_queue.get()
+        try:
+            _execute_job(job)
+        except Exception as e:            # never let the worker die
+            with _jobs_lock:
+                job["state"] = "error"
+                job["error"] = str(e)
+            print(f"[dt_server] worker error on job {job['id']}: {e}",
+                  file=sys.stderr)
+        finally:
+            _job_queue.task_done()
+
+
+def _execute_job(job):
+    """Run dt_label for one queued print job, streaming progress into `job`."""
+    with _jobs_lock:
+        job["state"]   = "running"
+        job["started"] = time.time()
+
+    rc, output = _run_dt_label(job["args"], job=job)
+
+    with _jobs_lock:
+        if rc == 0:
+            job["state"] = "done"
+        else:
+            job["state"] = "error"
+            # Prefer a stage-specific message captured from the event stream;
+            # otherwise fall back to dt_label's own output, tail-trimmed so a
+            # traceback doesn't end up in a desktop notification.
+            if not job["error"]:
+                tail = output.strip()[-400:]
+                job["error"] = tail or f"dt_label exited {rc}"
+            print(f"[dt_server] job {job['id']} (r{job['release_id']}) failed: "
+                  f"{job['error']}", file=sys.stderr)
+        job["finished"] = time.time()
+
+
+def start_worker():
+    """Start the background print worker.
+
+    Called from main() rather than at import time so that importing dt_server
+    (as the test suite does) does not spawn a thread that races the caller for
+    queued jobs — or worse, launches real dt_label subprocesses.
+    """
+    threading.Thread(target=_print_worker, daemon=True,
+                     name="print-worker").start()
 
 
 # ── CORS (allow requests from any moz-extension:// origin) ───────────────────
@@ -53,9 +163,11 @@ def add_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
-@app.route("/print",   methods=["OPTIONS"])
-@app.route("/status",  methods=["OPTIONS"])
-@app.route("/preview", methods=["OPTIONS"])
+@app.route("/print",      methods=["OPTIONS"])
+@app.route("/status",     methods=["OPTIONS"])
+@app.route("/preview",    methods=["OPTIONS"])
+@app.route("/progress",   methods=["OPTIONS"])
+@app.route("/jobs/clear", methods=["OPTIONS"])
 def preflight():
     return "", 204
 
@@ -118,17 +230,8 @@ def _check_anthropic():
 
 
 def _do_check_anthropic():
-    import json
     import util
-    auth_file = util.userfile("beatport_auth.json")
-    api_key = None
-    if os.path.exists(auth_file):
-        with open(auth_file) as f:
-            data = json.load(f)
-        api_key = data.get("anthropic_api_key")
-    if not api_key:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
+    if util.resolve_anthropic_key():
         return {"status": "ok"}
     return {"status": "error", "message": "no API key configured"}
 
@@ -144,31 +247,13 @@ def _check_llm():
 
 
 def _do_check_llm():
-    import json as _json
     import util
-    config: dict = {}
-    path = util.userfile("find_config")
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    config[k.strip()] = v.strip()
+    config = util.load_kv_config(util.userfile("find_config"))
 
     backend = config.get("backend", "local")
 
     if backend == "anthropic":
-        # Re-use the same key lookup as _do_check_anthropic()
-        auth_file = util.userfile("beatport_auth.json")
-        api_key = None
-        if os.path.exists(auth_file):
-            with open(auth_file) as f:
-                data = _json.load(f)
-            api_key = data.get("anthropic_api_key")
-        if not api_key:
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if api_key:
+        if util.resolve_anthropic_key():
             return {"status": "ok", "backend": "anthropic"}
         return {"status": "error", "message": "no Anthropic API key configured",
                 "backend": "anthropic"}
@@ -210,26 +295,80 @@ def print_label():
 
     if preview:
         return _run_preview(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
-    return _run_print(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
+    return _queue_print(release_id, profile, split=split, discs=discs, no_bpm=no_bpm)
+
+
+@app.route("/progress", methods=["GET"])
+def progress():
+    """Current job stages, queue depth, and recently finished jobs.
+
+    The extension polls this while the popup is open and, for the toolbar
+    badge, while any job is active.
+    """
+    with _jobs_lock:
+        jobs = list(_jobs.values())
+
+    active  = [j for j in jobs if j["state"] == "running"]
+    waiting = [j for j in jobs if j["state"] == "queued"]
+    recent  = [j for j in jobs if j["state"] in ("done", "error")]
+    recent.sort(key=lambda j: j.get("finished", 0), reverse=True)
+
+    return jsonify({
+        "ok":      True,
+        "stages":  list(STAGES),
+        "current": _public_job(active[0]) if active else None,
+        "queued":  [_public_job(j) for j in waiting],
+        "depth":   len(active) + len(waiting),
+        "failures": sum(1 for j in recent if j["state"] == "error"),
+        "recent":  [_public_job(j) for j in recent[:5]],
+    })
+
+
+@app.route("/jobs/clear", methods=["POST"])
+def clear_jobs():
+    """Drop finished/failed job history (clears the badge's error state)."""
+    with _jobs_lock:
+        for jid in [j["id"] for j in _jobs.values()
+                    if j["state"] in ("done", "error")]:
+            _jobs.pop(jid, None)
+    return jsonify({"ok": True})
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _run_dt_label(args, *, capture=False):
-    """Run dt_label with the given argument list.
-    Returns (returncode, stdout+stderr combined).
+def _run_dt_label(args, *, job=None):
+    """Run dt_label, streaming its output.
+
+    Progress lines (prefixed with _PROGRESS_PREFIX) are folded into `job` as
+    they arrive; everything else is accumulated and returned so a failure can
+    be reported with real diagnostics.
+
+    Returns (returncode, non-progress output).
     """
-    cmd = [sys.executable, DT_LABEL] + args
-    result = subprocess.run(
+    cmd = [sys.executable, DT_LABEL] + (["--progress"] if job else []) + args
+    proc = subprocess.Popen(
         cmd,
-        capture_output=capture,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,               # line buffered, so progress arrives promptly
         cwd=SCRIPT_DIR,
     )
-    output = ""
-    if capture:
-        output = (result.stdout or "") + (result.stderr or "")
-    return result.returncode, output
+
+    lines = []
+    for line in proc.stdout:
+        if job is not None and line.startswith(_PROGRESS_PREFIX):
+            try:
+                event = json.loads(line[len(_PROGRESS_PREFIX):])
+            except ValueError:
+                continue
+            with _jobs_lock:
+                _apply_event(job, event)
+        else:
+            lines.append(line)
+
+    proc.wait()
+    return proc.returncode, "".join(lines)
 
 
 def _split_args(split, discs):
@@ -247,19 +386,25 @@ def _bpm_args(no_bpm):
     return ["--no-bpm"] if no_bpm else []
 
 
-def _run_print(release_id, profile, split=False, discs=None, no_bpm=False):
-    with _print_lock:
-        rc, output = _run_dt_label(
-            ["--label-profile", profile] + _split_args(split, discs)
-            + _bpm_args(no_bpm) + ["--", release_id],
-            capture=True,
-        )
-    if rc != 0:
-        return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
-    return jsonify({"ok": True})
+def _queue_print(release_id, profile, split=False, discs=None, no_bpm=False):
+    """Enqueue a print job and return immediately with its id and queue depth."""
+    job = _new_job(release_id, "print")
+    job["args"] = (["--label-profile", profile] + _split_args(split, discs)
+                   + _bpm_args(no_bpm) + ["--", release_id])
+    _job_queue.put(job)
+    return jsonify({
+        "ok":     True,
+        "job_id": job["id"],
+        "queued": _queue_depth(),
+    })
 
 
 def _run_preview(release_id, profile, split=False, discs=None, no_bpm=False):
+    """Render previews synchronously — no printer involved, so no queueing.
+
+    Still reported as a job so the popup can show stage progress while its
+    own request is in flight (Flask serves other requests on separate threads).
+    """
     # Clear any previous previews
     for old in glob.glob(os.path.join(PREVIEW_DIR, "*.png")):
         try:
@@ -267,21 +412,46 @@ def _run_preview(release_id, profile, split=False, discs=None, no_bpm=False):
         except OSError:
             pass
 
+    job = _new_job(release_id, "preview")
+    with _jobs_lock:
+        job["state"] = "running"
+
     rc, output = _run_dt_label([
         "--preview",
         "--label-profile", profile,
         "--output", PREVIEW_DIR,
-    ] + _split_args(split, discs) + _bpm_args(no_bpm) + ["--", release_id], capture=True)
+    ] + _split_args(split, discs) + _bpm_args(no_bpm) + ["--", release_id], job=job)
+
+    with _jobs_lock:
+        job["finished"] = time.time()
+        if rc != 0:
+            job["state"] = "error"
+            if not job["error"]:
+                job["error"] = output.strip() or f"dt_label exited {rc}"
+        else:
+            job["state"] = "done"
 
     if rc != 0:
-        return jsonify({"ok": False, "message": output or f"dt_label exited {rc}"}), 500
+        return jsonify({"ok": False, "message": job["error"]}), 500
 
     pngs = sorted(glob.glob(os.path.join(PREVIEW_DIR, "*.png")))
     if not pngs:
         return jsonify({"ok": False, "message": "dt_label produced no PNG"}), 500
 
     urls = [f"/preview/{os.path.basename(p)}" for p in pngs]
-    return jsonify({"ok": True, "preview_urls": urls})
+    return jsonify({"ok": True, "preview_urls": urls, "job_id": job["id"]})
+
+
+def _queue_depth():
+    """Number of jobs waiting or in flight."""
+    with _jobs_lock:
+        return sum(1 for j in _jobs.values()
+                   if j["state"] in ("queued", "running"))
+
+
+def _public_job(job):
+    """Strip internal fields before sending a job over HTTP."""
+    return {k: v for k, v in job.items() if k != "args"}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -291,6 +461,8 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Port to listen on (default: {DEFAULT_PORT})")
     args = parser.parse_args()
+
+    start_worker()
 
     print(f"dt_server listening on http://localhost:{args.port}")
     print("Press Ctrl-C to stop.")

@@ -268,3 +268,139 @@ class TestNormalizeLoudnorm:
         with patch("subprocess.run", return_value=result):
             with pytest.raises(ConversionException, match="Failed to parse loudnorm"):
                 normalize_loudnorm("/tmp/input.wav", "/tmp/output.aiff")
+
+
+# ─── split_wav_file: the fallback cascade ─────────────────────────────────────
+#
+# split_wav_file tries six strategies in order until the region count matches
+# the Discogs track count: smpl loops (≥30s then ≥6s), ltxt markers (≥30s then
+# ≥6s), and raw cue positions (≥30s then ≥6s). Picking the wrong one silently
+# produces wrong track boundaries — an album split in the wrong places, which
+# you only notice on playback. None of this was covered.
+
+RATE = 44100
+
+
+def _sec(n):
+    """Seconds → samples."""
+    return int(n * RATE)
+
+
+def _release(total_tracks, positions=None):
+    rel = MagicMock()
+    rel.getTotalTracks.return_value = total_tracks
+    rel.getId.return_value = 999
+    positions = positions or [f"A{i+1}" for i in range(total_tracks)]
+    tracks = []
+    for p in positions:
+        t = MagicMock()
+        t.__getitem__ = MagicMock(side_effect=lambda k, _p=p: _p if k == "position" else "")
+        tracks.append(t)
+    rel.getTrack.side_effect = lambda i: tracks[i]
+    rel.__str__ = lambda self: "Fake Release"
+    return rel
+
+
+def _run_split(tmp_path, *, total_tracks, loops=(), markerslist=(), markers=(),
+               file_len_s=600, positions=None):
+    """Drive split_wav_file with controlled marker data and capture the writes."""
+    rdata = [0] * _sec(file_len_s)
+    read_ret = (RATE, rdata, 16, list(markers), list(markerslist), list(loops))
+    written = []
+
+    def fake_write(filename, rate, data, bitrate=None):
+        written.append((filename, len(data)))
+
+    with patch.object(dt_process.client_interface, "DiscogsRelease",
+                      return_value=_release(total_tracks, positions)), \
+         patch.object(dt_process.wavfile, "read", return_value=read_ret), \
+         patch.object(dt_process.wavfile, "write", side_effect=fake_write):
+        created = dt_process.split_wav_file("in.wav", str(tmp_path), 999)
+    return created, written
+
+
+class TestSplitFallbackCascade:
+    def test_smpl_loops_used_when_they_match(self, tmp_path):
+        loops = [[_sec(0), _sec(300)], [_sec(300), _sec(600)]]
+        created, written = _run_split(tmp_path, total_tracks=2, loops=loops)
+        assert len(created) == 2
+        assert [n for _, n in written] == [_sec(300), _sec(300)]
+
+    def test_short_loops_ignored_at_30s_but_kept_at_6s(self, tmp_path):
+        """A sub-30s track must still be found by the second pass."""
+        loops = [[_sec(0), _sec(10)], [_sec(10), _sec(20)]]
+        created, _ = _run_split(tmp_path, total_tracks=2, loops=loops,
+                                file_len_s=20)
+        assert len(created) == 2
+
+    def test_loops_under_six_seconds_never_used(self, tmp_path):
+        """Sub-6s blips are noise between takes, not tracks."""
+        loops = [[_sec(0), _sec(2)], [_sec(2), _sec(4)]]
+        with pytest.raises(ConversionException, match="Region count mismatch"):
+            _run_split(tmp_path, total_tracks=2, loops=loops, file_len_s=4)
+
+    def test_falls_through_to_ltxt_markers(self, tmp_path):
+        """No usable loops → ltxt lengths decide the regions."""
+        markerslist = [{"position": _sec(0),   "length": _sec(200)},
+                       {"position": _sec(200), "length": _sec(200)}]
+        created, written = _run_split(tmp_path, total_tracks=2,
+                                      markerslist=markerslist)
+        assert len(created) == 2
+        assert [n for _, n in written] == [_sec(200), _sec(200)]
+
+    def test_falls_through_to_cue_positions(self, tmp_path):
+        """No loops and no ltxt lengths → consecutive cue positions."""
+        markers = [_sec(200), _sec(400)]
+        created, written = _run_split(tmp_path, total_tracks=3, markers=markers)
+        assert len(created) == 3
+        # 0 and file_length are appended as implicit boundaries
+        assert [n for _, n in written] == [_sec(200), _sec(200), _sec(200)]
+
+    def test_loops_win_over_markers_when_both_present(self, tmp_path):
+        """smpl loops are tried first and must take precedence."""
+        loops = [[_sec(0), _sec(300)], [_sec(300), _sec(600)]]
+        markerslist = [{"position": _sec(0), "length": _sec(100)},
+                       {"position": _sec(100), "length": _sec(100)}]
+        _, written = _run_split(tmp_path, total_tracks=2, loops=loops,
+                                markerslist=markerslist)
+        assert [n for _, n in written] == [_sec(300), _sec(300)]
+
+    def test_mismatch_raises_with_both_counts(self, tmp_path):
+        loops = [[_sec(0), _sec(300)]]
+        with pytest.raises(ConversionException) as exc:
+            _run_split(tmp_path, total_tracks=4, loops=loops)
+        msg = str(exc.value)
+        assert "1 regions" in msg and "4 tracks" in msg
+
+    def test_no_markers_at_all_raises(self, tmp_path):
+        with pytest.raises(ConversionException, match="Region count mismatch"):
+            _run_split(tmp_path, total_tracks=2)
+
+    def test_duplicate_positions_rejected(self, tmp_path):
+        """Two tracks at the same position would overwrite one another."""
+        loops = [[_sec(0), _sec(300)], [_sec(300), _sec(600)]]
+        with pytest.raises(ConversionException, match="dupe pos"):
+            _run_split(tmp_path, total_tracks=2, loops=loops,
+                       positions=["A1", "A1"])
+
+    def test_output_filenames_use_release_and_position(self, tmp_path):
+        loops = [[_sec(0), _sec(300)], [_sec(300), _sec(600)]]
+        _, written = _run_split(tmp_path, total_tracks=2, loops=loops,
+                                positions=["A1", "B2"])
+        names = [os.path.basename(f) for f, _ in written]
+        assert names == ["999.A1.wav", "999.B2.wav"]
+
+    def test_returned_tuples_describe_each_track(self, tmp_path):
+        loops = [[_sec(0), _sec(300)], [_sec(300), _sec(600)]]
+        created, _ = _run_split(tmp_path, total_tracks=2, loops=loops)
+        for track, path, ext, copy in created:
+            assert ext == "wav"
+            assert copy is False
+            assert path.endswith(".wav")
+
+    def test_regions_are_contiguous_and_ordered(self, tmp_path):
+        """Sliced audio must cover the file in order, with no overlap."""
+        loops = [[_sec(0), _sec(200)], [_sec(200), _sec(400)],
+                 [_sec(400), _sec(600)]]
+        _, written = _run_split(tmp_path, total_tracks=3, loops=loops)
+        assert sum(n for _, n in written) == _sec(600)

@@ -7,3 +7,8 @@ __pycache__
 firefox-ext/.amo-upload-uuid
 web-ext-artifacts/
 test_out/
+
+# coverage
+.coverage
+.coverage.*
+htmlcov/

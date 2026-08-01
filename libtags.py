@@ -112,7 +112,16 @@ def track_from_comment(comment: str, index: int) -> client_interface.DiscogsTrac
 class AudioFile(object):
     def __init__(self, filename: str, track: client_interface.DiscogsTrack | None = None) -> None:
         self.filename = filename
-        self.obj: MutagenFileType | None = mutagen.File(filename)  # type: ignore[reportAttributeAccessIssue]
+        # mutagen signals an unreadable file two different ways: File() returns
+        # None for an unknown container, but raises (e.g. InvalidChunk) for one
+        # that is recognised yet corrupt.  Both mean "skip this file", and
+        # dt_collection catches TagsException to keep a library scan going — so
+        # a raw mutagen error escaping here would abort the whole scan on one
+        # bad file.
+        try:
+            self.obj: MutagenFileType | None = mutagen.File(filename)  # type: ignore[reportAttributeAccessIssue]
+        except Exception as e:
+            raise TagsException("mutagen couldn't read %s: %s" % (filename, e)) from e
         if self.obj is None:
             raise TagsException("mutagen couldn't open " + filename)
 
@@ -219,7 +228,11 @@ class AudioFile(object):
                 #                (the image data itself is raw bytes, not encoded text)
                 value = clazz(type=0, encoding=0, mime=mimetype, data=value)
             else:
-                if mkey == "TRCK":
+                if mkey == "TBPM":
+                    # ID3 text frames take strings; an int raises deep inside
+                    # mutagen's spec validation with an opaque message.
+                    value = str(value)
+                elif mkey == "TRCK":
                     track_val = cast(tuple[int, int], value)
                     if track_val[1]:
                         value = "%d/%d" % track_val

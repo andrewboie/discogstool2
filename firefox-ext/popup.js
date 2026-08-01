@@ -72,6 +72,7 @@ printBtn.addEventListener("click", async () => {
   const hideBpm = hideBpmEl.checked;
 
   printBtn.disabled = true;
+  holdStatus = false;
   setStatus(preview ? "Generating preview…" : "Sending to printer…");
 
   const controller = new AbortController();
@@ -98,8 +99,14 @@ printBtn.addEventListener("click", async () => {
       }
       const count = data.preview_urls.length;
       setStatus(`${count} preview${count > 1 ? "s" : ""} opened in new tab${count > 1 ? "s" : ""}.`, "ok");
+      holdStatus = true;   // terminal message; don't let polling overwrite it
     } else {
-      setStatus("Label sent to printer.", "ok");
+      // Deliberately no status text here. The job is queued server-side and
+      // its state changes within milliseconds, so anything written now goes
+      // stale immediately — that is how the line ended up reading "Queued."
+      // while the label was already printing. pollProgress() owns this line.
+      browser.runtime.sendMessage({ type: "job-queued" }).catch(() => {});
+      pollProgress();      // paint real state at once rather than waiting a tick
     }
   } catch (err) {
     if (err.name === "AbortError") {
@@ -109,11 +116,148 @@ printBtn.addEventListener("click", async () => {
     } else {
       setStatus(err.message, "error");
     }
+    holdStatus = true;     // a request-level failure outranks job state
   } finally {
     clearTimeout(timer);
     printBtn.disabled = false;
   }
 });
+
+// ── Job progress polling ──────────────────────────────────────────────────────
+// The popup polls while it is open. Firefox tears the popup down when it loses
+// focus, which stops the interval automatically — the toolbar badge (driven by
+// background.js) is what keeps reporting once this window is gone.
+
+const POLL_MS = 500;
+
+// Set when a terminal message (preview opened, request failed) should stay
+// put; cleared at the start of the next print attempt.
+let holdStatus = false;
+
+const progressEl   = document.getElementById("progress");
+const jobTitleEl   = document.getElementById("job-title");
+const queueCountEl = document.getElementById("queue-count");
+const jobErrorEl   = document.getElementById("job-error");
+const stageEls     = Object.fromEntries(
+  [...document.querySelectorAll("#stages li")].map(li => [li.dataset.stage, li])
+);
+
+const MARKS = { pending: "○", active: "◐", done: "●", skip: "–", error: "✕", warn: "!" };
+
+function renderStage(li, info) {
+  const state = info?.state ?? "pending";
+
+  // Map server-side stage states onto display classes.
+  let cls = "pending";
+  if (state === "start" || state === "progress") cls = "active";
+  else if (state === "done")        cls = "done";
+  else if (state === "skip")        cls = "skip";
+  else if (state === "error")       cls = "error";
+
+  li.className = cls;
+  li.querySelector(".stage-mark").textContent = MARKS[cls];
+
+  // "2/4" style counts where the server supplied them.
+  const count = li.querySelector(".stage-count");
+  if (info && info.total != null && info.done != null && info.total > 0) {
+    count.textContent = `${info.done}/${info.total}`;
+  } else if (info && info.labels != null && state === "done") {
+    count.textContent = info.labels > 1 ? `${info.labels} labels` : "";
+  } else {
+    count.textContent = "";
+  }
+
+}
+
+// How long a finished job stays on screen before the panel clears itself.
+// Without this the popup keeps showing the last job forever, so reopening it
+// hours later looks like something is still in progress.
+const RECENT_GRACE_S = 90;
+
+const STAGE_VERB = {
+  lookup:  "Looking up release",
+  samples: "Downloading samples",
+  bpm:     "Analysing BPM",
+  render:  "Rendering label",
+  print:   "Printing",
+};
+
+function describeJob(job, waiting) {
+  if (job.state === "error")  return [job.error || "Failed.", "error"];
+  if (job.state === "queued") {
+    return [waiting > 1 ? `Queued — ${waiting} ahead.` : "Queued.", ""];
+  }
+  if (job.state === "done") {
+    return [job.kind === "preview" ? "Preview ready." : "Printed.", "ok"];
+  }
+
+  // Running: report the furthest stage that is actually in progress.
+  let text = "Working…";
+  for (const name of Object.keys(STAGE_VERB)) {
+    const info = job.stages?.[name];
+    if (!info) continue;
+    if (info.state === "start" || info.state === "progress") {
+      text = STAGE_VERB[name];
+      if (info.total > 0 && info.done != null) text += ` ${info.done}/${info.total}`;
+      text += "…";
+    }
+  }
+  return [text, ""];
+}
+
+function renderProgress(data) {
+  const now    = Date.now() / 1000;
+  const recent = data.recent?.[0] ?? null;
+  const fresh  = recent && (now - (recent.finished ?? 0)) < RECENT_GRACE_S;
+  const queued = data.queued ?? [];
+
+  // Prefer the running job; if nothing is running yet, show the one about to
+  // run (there is a brief window after POST where the job exists but the
+  // worker has not picked it up); otherwise show a just-finished job.
+  const job = data.current ?? queued[0] ?? (fresh ? recent : null);
+
+  if (!job && !data.depth) {
+    progressEl.classList.add("hidden");
+    if (!holdStatus) setStatus("");
+    return;
+  }
+  progressEl.classList.remove("hidden");
+
+  // Jobs waiting *behind* whichever one is on screen.
+  const waiting = data.current ? queued.length : Math.max(0, queued.length - 1);
+  queueCountEl.textContent = waiting === 1 ? "1 queued" : `${waiting} queued`;
+  queueCountEl.classList.toggle("hidden", waiting === 0);
+
+  if (!job) return;
+
+  jobTitleEl.textContent = job.title || `r${job.release_id}`;
+  for (const [name, li] of Object.entries(stageEls)) {
+    renderStage(li, job.stages?.[name]);
+  }
+  jobErrorEl.textContent = job.error || "";
+  jobErrorEl.classList.toggle("hidden", !job.error);
+
+  // The status line reflects live job state — never a value captured earlier.
+  if (!holdStatus) {
+    const [text, cls] = describeJob(job, waiting);
+    setStatus(text, cls);
+  }
+}
+
+async function pollProgress() {
+  const port = portEl.value || DEFAULT_PORT;
+  try {
+    const resp = await fetch(`http://localhost:${port}/progress`,
+                             { signal: AbortSignal.timeout(2000) });
+    renderProgress(await resp.json());
+  } catch {
+    // dt_server unreachable — leave whatever was last drawn in place rather
+    // than flickering the panel away on a single dropped poll.
+  }
+}
+
+pollProgress();
+setInterval(pollProgress, POLL_MS);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

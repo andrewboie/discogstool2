@@ -718,3 +718,61 @@ class TestCreateBackend:
         """Unrecognised backend values should default to local (forward compat)."""
         b = create_backend({"backend": "future-backend"})
         assert isinstance(b, LocalLLMBackend)
+
+
+# ─── _dispatch_tool (shared by both backends) ─────────────────────────────────
+
+class TestDispatchTool:
+    """One tool implementation serves both backends.
+
+    The OpenAI and Anthropic backends previously each carried their own copy of
+    this dispatch — 38 identical lines — so a change to tool behaviour had to be
+    made twice or the two would diverge.
+    """
+
+    def test_select_release_returns_selection(self):
+        payload, selection = dt_find._dispatch_tool(
+            "select_release", {"release_id": 12345, "reasoning": "matches"})
+        assert payload == {"status": "ok"}
+        assert selection == (12345, "matches")
+
+    def test_select_release_coerces_string_id(self):
+        _, selection = dt_find._dispatch_tool(
+            "select_release", {"release_id": "12345"})
+        assert selection == (12345, "")
+
+    def test_select_release_rejects_malformed_id(self):
+        """A bad id must be reported to the model, not raise mid-conversation."""
+        payload, selection = dt_find._dispatch_tool(
+            "select_release", {"release_id": None})
+        assert selection is None
+        assert "Invalid release_id" in payload["error"]
+
+    def test_select_release_rejects_non_numeric_id(self):
+        payload, selection = dt_find._dispatch_tool(
+            "select_release", {"release_id": "not-a-number"})
+        assert selection is None
+        assert "error" in payload
+
+    def test_unknown_tool_reports_error(self):
+        payload, selection = dt_find._dispatch_tool("nope", {})
+        assert selection is None
+        assert payload["error"] == "Unknown tool: nope"
+
+    def test_search_returns_results_and_no_selection(self, capsys):
+        fake = {"results": [{"id": 1}, {"id": 2}], "count": 7}
+        with patch.object(dt_find, "_tool_search_discogs", return_value=fake):
+            payload, selection = dt_find._dispatch_tool(
+                "search_discogs", {"query": "blue miles davis"})
+        assert payload is fake
+        assert selection is None
+        out = capsys.readouterr().out
+        assert "Searching" in out
+        assert "2 result(s)" in out and "7 total" in out
+
+    def test_search_arguments_forwarded(self):
+        with patch.object(dt_find, "_tool_search_discogs",
+                          return_value={"results": [], "count": 0}) as mock:
+            dt_find._dispatch_tool("search_discogs",
+                                   {"artist": "Aphex", "year": "1994"})
+        mock.assert_called_once_with(artist="Aphex", year="1994")
