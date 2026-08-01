@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate extension icons — a simple vinyl label disc.
 
-Run from the firefox-ext directory:
+Run from ext/shared:
     python3 make_icons.py
 Requires Pillow (already a project dependency).
 """
@@ -51,7 +51,8 @@ if __name__ == "__main__":
     out_dir = os.path.join(os.path.dirname(__file__), "icons")
     os.makedirs(out_dir, exist_ok=True)
 
-    for size in (16, 32, 48, 96):
+    # 128 is required for the Chrome Web Store listing.
+    for size in (16, 32, 48, 96, 128):
         img = draw_icon(size)
         path = os.path.join(out_dir, f"icon-{size}.png")
         img.save(path)

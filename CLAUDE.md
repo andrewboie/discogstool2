@@ -39,6 +39,8 @@ build_ext.sh          Assembles firefox-ext/ and chrome-ext/ (both gitignored)
 tests/                pytest suite (one file per module)
 install_server.sh     macOS launchd plist installer for dt_server
 sign_extension.sh     AMO signing for the Firefox build
+publish_chrome.sh     Chrome Web Store upload/publish (unlisted)
+docs/                 Chrome Web Store setup guide
 requirements.txt      Python dependencies
 ```
 
@@ -229,9 +231,14 @@ launchctl kickstart -k gui/$(id -u)/com.discogstool.server  # restart
 
 - Firefox dev: `about:debugging` → Load Temporary Add-on → `firefox-ext/manifest.json`
 - Firefox prod: `./sign_extension.sh` (builds first; needs npm + AMO credentials in `~/.discogstool/amo_auth`)
-- Chrome: `chrome://extensions` → Developer mode → Load unpacked → `chrome-ext/`
+- Chrome dev: `chrome://extensions` → Developer mode → Load unpacked → `chrome-ext/`
+- Chrome prod: `./publish_chrome.sh` (builds, zips, uploads, submits for review)
 
-Chrome is installed unpacked rather than via the Web Store, so there is no signing step and no version gate — but Chrome shows a developer-mode notice, and the extension ID changes if the directory moves.
+Chrome has no equivalent of AMO's unlisted signing — Linux is the only platform where Chrome installs extensions hosted outside the Web Store — so on macOS an **unlisted Web Store item** is the only route to a signed, auto-updating extension. Unlisted is not a review exemption: Public, Unlisted and Private all go through the same review.
+
+The item and the OAuth credentials must be created by hand once; see `docs/chrome-webstore-setup.md`. Two traps documented there are worth repeating: the API cannot create an item, and it refuses to publish after a manual visibility change until you have published once with that visibility — so the unlisted setting must be applied *and* published manually before the script will work.
+
+`sign_extension.sh` and `publish_chrome.sh` both run `build_ext.sh` first, so a source change cannot be left out of a release. Credentials live in `~/.discogstool/amo_auth` and `~/.discogstool/cws_auth` (mode 600).
 
 **Important**: The `version` field in `ext/firefox/manifest.json` (and `ext/chrome/manifest.json`, which a test asserts stays in step) **must be incremented** whenever any extension file is changed (anything under `ext/`). AMO rejects re-signing with an already-used version number, so `sign_extension.sh` will fail with an error if you forget to bump it.
 
