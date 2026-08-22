@@ -101,11 +101,21 @@ def _apply_event(job, event):
         job["error"] = event.get("message") or "failed"
 
 
+# Let the printer settle between jobs.  A completed send only means the printer
+# has *accepted* the raster, not that the paper has stopped moving; starting the
+# next job's raster immediately is what used to overrun its buffer.
+_INTER_JOB_SETTLE_S = 2.0
+
+
 def _print_worker():
     """Drain _job_queue one job at a time."""
+    first = True
     while True:
         job = _job_queue.get()
         try:
+            if not first and job.get("kind") == "print":
+                time.sleep(_INTER_JOB_SETTLE_S)
+            first = False
             _execute_job(job)
         except Exception as e:            # never let the worker die
             with _jobs_lock:

@@ -87,7 +87,11 @@ An earlier revision implemented full status-packet readback (`_send_and_await`, 
 - `interpret_response` raises **`NameError`** — not `ValueError` — for a short buffer or bad header. brother_ql's own handler catches `ValueError`, so it is dead code; an uncaught `NameError` killed the print job *after* the label had printed.
 - Status packets are exactly 32 bytes, but TCP may split one across reads or coalesce several. Framing must buffer rather than assume one `recv()` is one packet.
 
-**Retry safety.** A `sendall()` timeout may leave the printer holding a half-received job; resending would make it consume the new job's header bytes as raster data and emit a garbage label. `print_label` therefore only retries when the failure was connection-establishment, not a mid-transfer timeout (see `_partially_written`).
+**Timeouts.** `_SEND_TIMEOUT` (default 300 s) is not a network-latency budget — it is *how long the printer may take to accept a whole label*. A QL printer buffers raster and drains it as it physically prints, so TCP backpressure keeps the write blocked for roughly as long as printing takes. brother_ql's network backend hardcodes 10 s in its own `_write()`, which is shorter than a long continuous label, so a queued batch would time out partway through. That is why `_send_raster()` drives the socket directly instead of going through `BrotherQLBackendNetwork` — the backend exists only to wrap connect+sendall and offers no way to override that 10 s. Both `connect_timeout` and `send_timeout` are overridable in `label_config`.
+
+A completed `sendall` also paces the queue: it returns only once the printer has taken the whole label. `dt_server` additionally waits `_INTER_JOB_SETTLE_S` between print jobs, because acceptance still isn't the same as the paper having stopped.
+
+**Retry and recovery.** A `sendall()` timeout leaves the printer holding a half-received job; anything sent next — the following queued label, or a manual reprint — is read as the missing raster and printed as static. So `print_label` never retries a mid-transfer failure (see `_partially_written`), and instead sends `_RESET_SEQUENCE` (200 nulls + `ESC @`, the same preamble `convert()` prepends) to flush the printer's command buffer. Nulls are no-ops in command mode and blank filler mid-raster, so the worst case is a short blank feed rather than a sheet of static. It is best-effort — nothing is acknowledged over 9100 — and the error message says whether the flush got through.
 
 ### dt_process pipeline
 
@@ -324,6 +328,8 @@ Two invariants make the probe valid, both pinned by tests:
 
 - Content layout never reads `H` — only the bottom-anchored QR and the die-cut ruled-line fill do, and neither runs in probe mode. That is why a probe can use a 1 px scratch canvas: Pillow clips the draws and the arithmetic is unchanged.
 - `_resolve_track_text()` is the single source of truth for a row's text. Anything affecting row content belongs in there, so probe and render can't diverge.
+
+`_position_column_width()` sizes the position column to the widest entry present rather than assuming a fixed 90 px. Most releases use short labels ("A1"), but continuous DJ mixes use timestamps ("14:03", ~97 px) and some sides are double letters ("AA1") — those used to overprint the title (r34333258). It is computed inside `render_label` so probe and render agree: the column feeds `TITLE_MAX_W`, which decides wrapping, which decides height.
 
 `render_label()` still warns via `log.warning` if content crosses `qr_top`. That should now be unreachable; it is a tripwire, not a safety net.
 

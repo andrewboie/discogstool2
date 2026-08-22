@@ -22,6 +22,7 @@ import os
 import re
 import time
 import json
+import math
 import socket
 import argparse
 import logging
@@ -90,6 +91,12 @@ _EXTRA_LINE_H = 50
 # Extra px added to the header when the release title wraps to a second line.
 # (58 px between title lines; original 70 px spacing applies to the last line.)
 _TITLE_WRAP_LINE_H = 58
+
+# Position column sizing.  _POS_W_MIN keeps the usual "A1" case looking the way
+# it always has; wider position strings grow the column instead of colliding
+# with the title.  _POS_W_GAP is the clear space between the two.
+_POS_W_MIN = 90
+_POS_W_GAP = 12
 
 # QR code size (px).  ~17 mm at 300 DPI — scannable from across a record shelf.
 _QR_SIZE = 200
@@ -526,6 +533,29 @@ def _layout_height(release, tracks_with_sides, profile, is_compilation,
     return height
 
 
+def _position_column_width(draw, font, tracks_with_sides):
+    """Width of the position column, sized to the widest position present.
+
+    Usually a short side/track label ("A1", "B12"), but some releases use
+    timestamps ("14:03" on a continuous DJ mix) or double-letter sides ("AA1").
+    A fixed width let those run straight into the title text — see r34333258.
+
+    Non-string positions (stub tracks in tests) are skipped rather than
+    measured.
+    """
+    widest = 0.0
+    for _side, _idx, track in tracks_with_sides:
+        try:
+            pos = track["position"]
+        except Exception:
+            continue
+        if isinstance(pos, str) and pos:
+            widest = max(widest, draw.textlength(pos, font=font))
+    # ceil, not int: truncating left the column a fraction of a pixel
+    # short of the widest string, which is still a collision.
+    return max(_POS_W_MIN, math.ceil(widest) + _POS_W_GAP)
+
+
 def render_label(release, tracks_with_sides, profile,
                  is_compilation, continuation=False, disc_info=None,
                  height_px=None, notes_lines=None, bpms=None, probe=False):
@@ -576,7 +606,13 @@ def render_label(release, tracks_with_sides, profile,
     f_notes_hdr = make_font("bold",      28)
 
     BPM_ZONE_W  = 110                         # right-side blank area for handwritten BPM
-    POS_W       = 90                          # position column width
+    # Position column: usually a short side/track label ("A1", "B12"), but some
+    # releases use timestamps ("14:03" on a continuous DJ mix) or double-letter
+    # sides ("AA1").  A fixed width let those run straight into the title text,
+    # so measure the widest one actually present and size the column to it.
+    # Computed here rather than by a caller so probe and render always agree —
+    # POS_W feeds TITLE_MAX_W, which decides wrapping, which decides height.
+    POS_W       = _position_column_width(draw, f_pos, tracks_with_sides)
     TITLE_MAX_W = CW - POS_W - BPM_ZONE_W - 16
 
     # Continuous labels auto-size their canvas; die-cut labels have a fixed canvas.
@@ -895,31 +931,94 @@ def render_labels_for_release(release, args, profile, bpms=None):
 # ── Printing ──────────────────────────────────────────────────────────────────
 
 # How long to wait for the printer to report completion after the raster data
-def _send_raster(instructions, printer_url):
+# Timeouts for talking to the printer.
+#
+# The send timeout is NOT a network-latency budget — it is "how long may the
+# printer take to accept an entire label".  A QL printer accepts raster into a
+# small buffer and drains it as it physically prints, so TCP backpressure keeps
+# the write blocked for roughly as long as printing takes.  brother_ql's network
+# backend hardcodes 10s in its own _write(), which is shorter than a long
+# continuous label takes to print — so a queued batch would reliably time out
+# partway through, leaving the printer holding a half-received job.  That is why
+# the next label then came out as static.
+#
+# We therefore drive the socket ourselves rather than going through
+# BrotherQLBackendNetwork: it exists only to wrap connect+sendall (its readback
+# is unusable here, see above), and it gives no way to override that 10s.
+#
+# Both are overridable in ~/.discogstool/label_config as connect_timeout and
+# send_timeout.
+_CONNECT_TIMEOUT = 10.0     # establishing the TCP connection
+_SEND_TIMEOUT    = 300.0    # writing a whole label, incl. time spent printing
+
+_DEFAULT_PRINTER_PORT = 9100
+
+
+def _parse_printer_url(printer_url):
+    """Split 'tcp://host:9100' (or 'host') into (host, port)."""
+    target = printer_url
+    if "://" in target:
+        target = target.split("://", 1)[1]
+    target = target.rstrip("/")
+    host, sep, port = target.partition(":")
+    return host, int(port) if sep and port else _DEFAULT_PRINTER_PORT
+
+
+def _send_raster(instructions, printer_url, connect_timeout=None,
+                 send_timeout=None):
     """Write raster instructions to the printer over TCP.
 
-    There is deliberately no completion readback.  brother_ql's helpers.send()
-    declines to wait on the network backend, and while the backend does expose
-    _read(), the QL-1110NWB was probed for 10s on port 9100 and returned zero
-    bytes — it simply does not report status over the network.  Waiting only
-    added dead time to every label and stalled the queue behind it, so
-    "sent to printer" is the last observable step.
+    There is deliberately no completion readback: the QL-1110NWB was probed for
+    10s on port 9100 and returned zero bytes, so "sent" is the last observable
+    step.  (The probe lives in git history — see _send_and_await/probe_printer.)
 
-    (The status-request probe lives in git history if a future printer needs
-    re-evaluating: see _send_and_await/probe_printer prior to this commit.)
+    Because the write blocks while the printer drains its buffer, a completed
+    sendall is a reasonable proxy for "the printer has taken the whole label",
+    which is also what paces a queue of jobs.
 
-    Raises OSError/TimeoutError if the write fails.
+    Raises OSError/TimeoutError if the connection or the write fails.
     """
-    from brother_ql.backends.network import BrotherQLBackendNetwork
+    host, port = _parse_printer_url(printer_url)
+    connect_timeout = _CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
+    send_timeout    = _SEND_TIMEOUT    if send_timeout    is None else send_timeout
 
-    printer = BrotherQLBackendNetwork(printer_url)
+    sock = socket.create_connection((host, port), timeout=connect_timeout)
     try:
-        printer.write(instructions)
+        # Raster is one big write; Nagle would only add latency.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(send_timeout)
+        sock.sendall(instructions)
     finally:
         try:
-            printer.dispose()
-        except Exception:
+            sock.close()
+        except OSError:
             pass
+
+
+# Recovery sequence for a printer left mid-raster by a failed send.
+#
+# This is the same preamble brother_ql's convert() puts at the head of every
+# job: 200 null bytes ("invalidate", which clears the command buffer) followed
+# by ESC @ ("initialize").  Nulls are no-ops in command mode, and if the printer
+# is still waiting on raster data they are consumed as blank pixels — so the
+# worst case is a short blank feed rather than the sheet of static you get from
+# sending a fresh job to a wedged printer.
+#
+# Best-effort: the printer never acknowledges anything over 9100, so a
+# successful write means only that it accepted the bytes.
+_RESET_SEQUENCE = b"\x00" * 200 + b"\x1B\x40"
+
+
+def reset_printer(printer_url, timeout=10.0):
+    """Try to flush a printer holding a partial job.  Returns True if sent."""
+    try:
+        _send_raster(_RESET_SEQUENCE, printer_url,
+                     connect_timeout=timeout, send_timeout=timeout)
+        log.debug("printer reset sequence sent to %s", printer_url)
+        return True
+    except (OSError, TimeoutError) as e:
+        log.warning("printer reset failed: %s", e)
+        return False
 
 
 def print_label(img, printer_url, model, profile, retries=3, retry_delay=5,
@@ -968,12 +1067,28 @@ def print_label(img, printer_url, model, profile, retries=3, retry_delay=5,
                           f"(attempt {attempt}/{retries})…", flush=True)
                     time.sleep(retry_delay)
                     continue
+
+            # The write died partway through, so the printer is holding an
+            # incomplete job.  Anything sent next — the following queued label,
+            # or a manual reprint — would be read as the missing raster and
+            # printed as static.  Flush it before giving up.
+            recovered = False
+            if _partially_written(e):
+                print("\n  Send failed mid-transfer; resetting printer…",
+                      flush=True)
+                recovered = reset_printer(printer_url)
+
+            hint = ("  Printer buffer flushed; the next label should print "
+                    "normally.\n"
+                    if recovered else
+                    "  Could not reach the printer to reset it — power-cycle it "
+                    "to clear the buffer,\n  or the next label may print as "
+                    "static.\n")
             raise RuntimeError(
                 f"Printer send failed: {e}\n"
                 "  Check that the printer is on, not in an error state "
                 "(solid green LED), and reachable on the network.\n"
-                "  If a label printed as static, power-cycle the printer to "
-                "clear its raster buffer before retrying."
+                + hint
             ) from e
 
 
@@ -1160,7 +1275,7 @@ def process_release(rid, args, profile, printer_url, model):
 
 
 def main():
-    global _progress_on
+    global _progress_on, _CONNECT_TIMEOUT, _SEND_TIMEOUT
 
     parser = argparse.ArgumentParser(
         description="Print a Discogs release stat-block label for a vinyl sleeve.",
@@ -1237,6 +1352,17 @@ def main():
         parser.error("provide a release ID or use -f/--file for batch input")
     if args.release_id is not None and args.file:
         parser.error("release_id and -f/--file are mutually exclusive")
+
+    # Printer timeouts are tunable from label_config; a very long or slow
+    # label can legitimately hold the socket open for minutes.
+    for key, name in (("connect_timeout", "_CONNECT_TIMEOUT"),
+                      ("send_timeout",    "_SEND_TIMEOUT")):
+        if key in config:
+            try:
+                globals()[name] = float(config[key])
+            except (TypeError, ValueError):
+                print(f"  Ignoring bad {key}={config[key]!r} in label_config",
+                      file=sys.stderr)
 
     printer_url  = config.get("printer")
     model        = config.get("model",   DEFAULT_MODEL)

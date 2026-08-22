@@ -827,17 +827,35 @@ import time
 import threading
 
 
-def _fake_printer(hold=0.0):
-    """Throwaway TCP server that accepts a job and says nothing. Returns port."""
+def _fake_printer(hold=0.0, stall=0.0, payload_len=0):
+    """Throwaway TCP server standing in for the printer.
+
+    hold:  accept, then sit there without reading (connection idle).
+    stall: accept, refuse to read for this long — the printer is busy
+           physically printing — then drain. This is what fills the socket
+           buffer and blocks the sender.
+    """
     import socket as _s
-    srv = _s.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    srv = _s.socket()
+    srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0)); srv.listen(1)
     port = srv.getsockname()[1]
 
     def serve():
         try:
             conn, _ = srv.accept()
-            conn.recv(65536)
-            time.sleep(hold)
+            if stall:
+                time.sleep(stall)
+                conn.settimeout(30)
+                total = 0
+                while total < payload_len:
+                    chunk = conn.recv(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+            else:
+                conn.recv(1 << 16)
+                time.sleep(hold)
             conn.close()
         except Exception:
             pass
@@ -848,35 +866,67 @@ def _fake_printer(hold=0.0):
     return port
 
 
-class TestPrinterSend:
-    """The printer does not report completion over the network.
+class TestParsePrinterUrl:
+    @pytest.mark.parametrize("url,expected", [
+        ("tcp://printer.local:9100", ("printer.local", 9100)),
+        ("tcp://192.168.2.124:9100", ("192.168.2.124", 9100)),
+        ("tcp://192.168.2.124",      ("192.168.2.124", 9100)),   # default port
+        ("192.168.2.124:9100",       ("192.168.2.124", 9100)),   # no scheme
+        ("printer.local",            ("printer.local", 9100)),
+        ("tcp://printer.local:9100/", ("printer.local", 9100)),  # trailing slash
+        ("tcp://printer.local:1234", ("printer.local", 1234)),   # custom port
+    ])
+    def test_parses(self, url, expected):
+        assert dt_label._parse_printer_url(url) == expected
 
-    Probed for 10s on port 9100: zero bytes back.  So _send_raster writes and
-    returns, and "sent to printer" is the last observable step.
+
+class TestPrinterSend:
+    """The printer accepts raster into a small buffer and drains it as it
+    prints, so a write blocks for roughly as long as printing takes.
+
+    brother_ql's network backend hardcodes a 10s sendall timeout, which is
+    shorter than a long continuous label takes — so a queued batch timed out
+    partway through and left the printer holding half a job, which is what made
+    the *next* label come out as static. We drive the socket ourselves to
+    control that budget.
     """
 
     def test_writes_and_returns(self):
-        pytest.importorskip("brother_ql")
         port = _fake_printer()
         assert dt_label._send_raster(b"\x00" * 400,
                                      f"tcp://127.0.0.1:{port}") is None
 
-    def test_returns_promptly(self):
-        """No readback wait: a silent printer must not stall the caller."""
-        pytest.importorskip("brother_ql")
-        port = _fake_printer(hold=2.0)
+    def test_survives_a_printer_busy_longer_than_ten_seconds(self):
+        """The regression: a stall past brother_ql's hardcoded 10s must be fine."""
+        payload = b"\x00" * (4 * 1024 * 1024)
+        port = _fake_printer(stall=12, payload_len=len(payload))
         started = time.time()
-        dt_label._send_raster(b"\x00" * 400, f"tcp://127.0.0.1:{port}")
-        assert time.time() - started < 0.5
+        dt_label._send_raster(payload, f"tcp://127.0.0.1:{port}",
+                              send_timeout=120)
+        assert time.time() - started >= 11        # really did block on the printer
 
-    def test_write_failure_raises(self):
-        """A dead port must raise so print_label can turn it into RuntimeError."""
-        pytest.importorskip("brother_ql")
+    def test_short_budget_still_times_out(self):
+        """Sanity check that the stall is real, not the test being lenient."""
+        payload = b"\x00" * (4 * 1024 * 1024)
+        port = _fake_printer(stall=12, payload_len=len(payload))
+        with pytest.raises((TimeoutError, OSError)):
+            dt_label._send_raster(payload, f"tcp://127.0.0.1:{port}",
+                                  send_timeout=2)
+
+    def test_default_send_budget_is_generous(self):
+        """A short default is what caused this; guard against it creeping back."""
+        assert dt_label._SEND_TIMEOUT >= 120
+
+    def test_connect_failure_raises_promptly(self):
+        started = time.time()
         with pytest.raises(OSError):
-            dt_label._send_raster(b"\x00" * 400, "tcp://127.0.0.1:1")
+            dt_label._send_raster(b"\x00" * 400, "tcp://127.0.0.1:1",
+                                  connect_timeout=2)
+        assert time.time() - started < 5
 
     def test_partially_written_blocks_retry(self):
-        """A mid-transfer timeout must not be treated as safely retryable."""
+        """A mid-transfer timeout must not be retried — the printer is holding
+        half a job, and resending makes it read the new header as raster."""
         assert dt_label._partially_written(TimeoutError("timed out")) is True
 
     def test_connection_error_is_retryable(self):
@@ -1113,3 +1163,169 @@ class TestRenderedContent:
         img = render_label(_fake_render_release(),
                            _make_render_tracks([("A", 3)]), profile, False)
         assert (img.width, img.height) == (profile["width_px"], profile["height_px"])
+
+
+from PIL import Image as _PILImage
+
+
+class TestPrinterRecovery:
+    """A send that dies mid-transfer leaves the printer holding a partial job.
+
+    Whatever is sent next — the following queued label, or a manual reprint —
+    gets read as the missing raster and printed as static. print_label
+    therefore flushes the printer before reporting the failure.
+    """
+
+    def test_reset_sequence_is_invalidate_plus_initialize(self):
+        """Matches the preamble convert() puts at the head of every job."""
+        assert dt_label._RESET_SEQUENCE == b"\x00" * 200 + b"\x1b\x40"
+
+    def test_reset_sends_the_sequence(self):
+        import socket as _s
+        received = []
+        srv = _s.socket(); srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def serve():
+            try:
+                conn, _ = srv.accept()
+                conn.settimeout(5)
+                buf = b""
+                while len(buf) < len(dt_label._RESET_SEQUENCE):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                received.append(buf)
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                srv.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        assert dt_label.reset_printer(f"tcp://127.0.0.1:{port}") is True
+        time.sleep(0.2)
+        assert received and received[0] == dt_label._RESET_SEQUENCE
+
+    def test_reset_reports_failure_when_unreachable(self):
+        """Must not raise — recovery is best-effort on top of an existing error."""
+        assert dt_label.reset_printer("tcp://127.0.0.1:1", timeout=2) is False
+
+    def test_mid_transfer_failure_triggers_reset(self):
+        """The whole point: a timeout must flush before surfacing the error."""
+        calls = []
+
+        def fake_send(instructions, url, **kw):
+            calls.append(instructions)
+            if len(calls) == 1:
+                raise TimeoutError("timed out")      # the real job
+            return None                              # the reset
+
+        img = _PILImage.new("RGB", (1164, 400), "white")
+        with patch.object(dt_label, "_send_raster", side_effect=fake_send):
+            with pytest.raises(RuntimeError) as exc:
+                dt_label.print_label(img, "tcp://127.0.0.1:9100",
+                                     "QL-1110NWB",
+                                     LABEL_PROFILES["dk22243"], retries=1)
+        assert len(calls) == 2, "reset was not attempted"
+        assert calls[1] == dt_label._RESET_SEQUENCE
+        assert "flushed" in str(exc.value)
+
+    def test_connection_refused_does_not_trigger_reset(self):
+        """Nothing was written, so there is nothing to flush."""
+        calls = []
+
+        def fake_send(instructions, url, **kw):
+            calls.append(instructions)
+            raise ConnectionRefusedError("refused")
+
+        img = _PILImage.new("RGB", (1164, 400), "white")
+        with patch.object(dt_label, "_send_raster", side_effect=fake_send):
+            with pytest.raises(RuntimeError):
+                dt_label.print_label(img, "tcp://127.0.0.1:9100",
+                                     "QL-1110NWB",
+                                     LABEL_PROFILES["dk22243"], retries=1)
+        assert all(c != dt_label._RESET_SEQUENCE for c in calls)
+
+    def test_failed_reset_warns_about_power_cycling(self):
+        def fake_send(instructions, url, **kw):
+            raise TimeoutError("timed out")          # job and reset both fail
+
+        img = _PILImage.new("RGB", (1164, 400), "white")
+        with patch.object(dt_label, "_send_raster", side_effect=fake_send):
+            with pytest.raises(RuntimeError) as exc:
+                dt_label.print_label(img, "tcp://127.0.0.1:9100",
+                                     "QL-1110NWB",
+                                     LABEL_PROFILES["dk22243"], retries=1)
+        assert "power-cycle" in str(exc.value)
+
+
+class TestPositionColumnWidth:
+    """The position column is sized to its widest entry.
+
+    It used to be a fixed 90px, which is fine for "A1" but too narrow for the
+    timestamp positions some continuous-mix releases use ("14:03" needs ~97px)
+    — those ran straight into the track title. r34333258 (Aleksi Perälä,
+    Cycles) is the case that surfaced it.
+    """
+
+    PROFILE = LABEL_PROFILES["dk22243"]
+
+    def _width(self, positions):
+        from PIL import ImageDraw, Image as _I
+        d = ImageDraw.Draw(_I.new("RGB", (10, 10), "white"))
+        font = dt_label.make_font("bold", 38)
+        tracks = [("A", i, _qr_track(p, "T")) for i, p in enumerate(positions)]
+        return dt_label._position_column_width(d, font, tracks), d, font
+
+    def _clears(self, positions):
+        """Column must be wide enough for every position plus the gap."""
+        width, d, font = self._width(positions)
+        return all(d.textlength(p, font=font) + dt_label._POS_W_GAP <= width
+                   for p in positions)
+
+    def test_timestamp_positions_do_not_collide(self):
+        assert self._clears(["00:00", "14:03", "19:52"])
+
+    def test_double_letter_sides_fit(self):
+        assert self._clears(["AA1", "BB12"])
+
+    def test_short_positions_keep_the_default_width(self):
+        """Ordinary releases must look exactly as before."""
+        width, _, _ = self._width(["A1", "A2", "B1"])
+        assert width == dt_label._POS_W_MIN
+
+    def test_wide_positions_widen_the_column(self):
+        narrow, _, _ = self._width(["A1"])
+        wide,   _, _ = self._width(["00:00"])
+        assert wide > narrow
+
+    def test_widest_entry_decides(self):
+        mixed, _, _ = self._width(["A1", "00:00", "B2"])
+        alone, _, _ = self._width(["00:00"])
+        assert mixed == alone
+
+    def test_empty_track_list_uses_minimum(self):
+        width, _, _ = self._width([])
+        assert width == dt_label._POS_W_MIN
+
+    def test_non_string_positions_are_ignored(self):
+        """Stub tracks whose position isn't a string must not break layout."""
+        from PIL import ImageDraw, Image as _I
+        d = ImageDraw.Draw(_I.new("RGB", (10, 10), "white"))
+        t = MagicMock()
+        t.__getitem__ = MagicMock(side_effect=lambda k: MagicMock())
+        assert dt_label._position_column_width(
+            d, dt_label.make_font("bold", 38), [("A", 0, t)]) == dt_label._POS_W_MIN
+
+    def test_renders_with_timestamp_positions(self):
+        positions = ["00:00", "04:00", "08:59", "14:03"]
+        tracks = [(dt_label.get_side(p), i, _qr_track(p, f"FI3AC22{i:05d}"))
+                  for i, p in enumerate(positions)]
+        release = _qr_release()
+        kw = dt_label._render_kwargs(tracks, self.PROFILE, release=release,
+                                     is_compilation=False, bpms={})
+        img = render_label(release, tracks, self.PROFILE, False, **kw)
+        assert img.width == self.PROFILE["width_px"]
